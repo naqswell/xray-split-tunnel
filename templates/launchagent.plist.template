@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Шаблон LaunchAgent для xray. install.sh подставляет __LABEL__, __XRAY_BIN__,
+     __CONFIG__, __HOME__, __LOG_OUT__, __LOG_ERR__. Конфиг — секрет (chmod 600). -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__XRAY_BIN__</string>
+        <string>run</string>
+        <string>-config</string>
+        <string>__CONFIG__</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__LOG_OUT__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_ERR__</string>
+</dict>
+</plist>

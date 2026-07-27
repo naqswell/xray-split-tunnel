@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# xst — управление xray-split-tunnel: серверы, сервис, проверки.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  _dir="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$_dir/$SELF"
+done
+XST_ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
+# shellcheck source=lib/common.sh
+source "$XST_ROOT/lib/common.sh"
+xst_load_env
+
+cmd="${1:-help}"
+shift || true
+
+curl_direct() { env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy curl "$@"; }
+
+# ── команды ─────────────────────────────────────────────────────────────────
+cmd_list() {
+  local cur=""
+  [[ -f "$STATE_FILE" ]] && cur="$(cat "$STATE_FILE")"
+  xst_python list "$SUB_JSON" --current "$cur"
+}
+
+cmd_apply() {
+  local idx="${1:-}"
+  [[ -n "$idx" ]] || { idx="0"; [[ -f "$STATE_FILE" ]] && idx="$(cat "$STATE_FILE")"; }
+  idx="$(xst_python resolve "$SUB_JSON" "$idx")"
+
+  local remarks
+  remarks="$(xst_python apply "$SUB_JSON" "$idx" "$CONFIG_JSON" \
+    --http-port "$HTTP_PORT" --socks-port "$SOCKS_PORT" \
+    --bypass-domains "$BYPASS_DOMAINS" --bypass-cidrs "$BYPASS_CIDRS")"
+  chmod 600 "$CONFIG_JSON"
+  echo "$idx" > "$STATE_FILE"
+  ok "конфиг собран: [$idx] $remarks"
+
+  "$XRAY_BIN" run -test -config "$CONFIG_JSON" >/dev/null 2>&1 \
+    || die "xray отверг конфиг: $("$XRAY_BIN" run -test -config "$CONFIG_JSON" 2>&1 | tail -3)"
+
+  xst_write_shell_snippet
+  cmd_restart
+}
+
+cmd_update() {
+  local url
+  [[ -f "$SUB_URL_FILE" ]] || die "нет $SUB_URL_FILE — перезапусти install.sh"
+  url="$(cat "$SUB_URL_FILE")"
+  log "скачиваю подписку…"
+  xst_fetch_subscription "$url" "$SUB_JSON" || die "curl не смог скачать подписку"
+  local count
+  count="$(xst_python normalize "$SUB_JSON.raw" "$SUB_JSON.new")"
+  rm -f "$SUB_JSON.raw"
+  mv "$SUB_JSON.new" "$SUB_JSON"
+  chmod 600 "$SUB_JSON"
+  ok "подписка обновлена: $count серверов"
+  warn "нумерация могла измениться — сверься с \`xst list\`"
+  cmd_apply
+}
+
+cmd_restart() {
+  xst_launchctl_reload "$LABEL" "$PLIST"
+  sleep 1
+  ok "$LABEL перезапущен"
+}
+
+cmd_stop() {
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  ok "$LABEL выгружен (туннель выключен)"
+}
+
+cmd_start() {
+  xst_launchctl_reload "$LABEL" "$PLIST"
+  ok "$LABEL загружен"
+}
+
+cmd_status() {
+  echo "${C_B}сервис${C_R}"
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    local pid
+    pid="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}')"
+    ok "$LABEL загружен${pid:+, pid $pid}"
+  else
+    fail "$LABEL не загружен"
+  fi
+
+  echo "${C_B}порты${C_R}"
+  xst_is_listening "$HTTP_PORT"  && ok "HTTP  127.0.0.1:$HTTP_PORT"  || fail "порт $HTTP_PORT не слушается"
+  xst_is_listening "$SOCKS_PORT" && ok "SOCKS 127.0.0.1:$SOCKS_PORT" || fail "порт $SOCKS_PORT не слушается"
+
+  echo "${C_B}сервер${C_R}"
+  if [[ -f "$STATE_FILE" && -f "$SUB_JSON" ]]; then
+    xst_python list "$SUB_JSON" --current "$(cat "$STATE_FILE")" | grep -- "<- активен" || echo "  (не определён)"
+  fi
+
+  echo "${C_B}в обход туннеля${C_R}"
+  echo "  домены: ${BYPASS_DOMAINS:-(нет)}"
+  echo "  подсети: приватные${BYPASS_CIDRS:+, $BYPASS_CIDRS}"
+}
+
+cmd_check() {
+  local host="${1:-}"
+  [[ -n "$host" ]] || die "usage: xst check <домен|IP>"
+  local out tag
+  out="$(xst_python route-check "$CONFIG_JSON" "$host")"
+  tag="$(echo "$out" | cut -f1)"
+  local why
+  why="$(echo "$out" | cut -f3)"
+  if [[ "$tag" == "direct" ]]; then
+    ok "$host → ${C_B}direct${C_R} (мимо туннеля), правило: $why"
+  elif [[ "$tag" == "block" ]]; then
+    warn "$host → block (заблокирован правилом $why)"
+  else
+    ok "$host → ${C_B}через туннель${C_R} ($tag, $why)"
+  fi
+}
+
+cmd_run() {
+  [[ $# -gt 0 ]] || die "usage: xst run <команда> [аргументы]"
+  HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
+  https_proxy="$PROXY_URL" http_proxy="$PROXY_URL" \
+  ALL_PROXY="socks5://127.0.0.1:$SOCKS_PORT" \
+  exec "$@"
+}
+
+cmd_verify() {
+  local rc=0
+
+  echo "${C_B}1. конфиг${C_R}"
+  if "$XRAY_BIN" run -test -config "$CONFIG_JSON" >/dev/null 2>&1; then
+    ok "Configuration OK"
+  else
+    fail "xray отверг конфиг"; rc=1
+  fi
+
+  echo "${C_B}2. сервис и порты${C_R}"
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && ok "$LABEL загружен" || { fail "$LABEL не загружен"; rc=1; }
+  xst_is_listening "$HTTP_PORT" && ok "порт $HTTP_PORT слушается" || { fail "порт $HTTP_PORT молчит — см. xst logs"; rc=1; }
+
+  echo "${C_B}3. выходной IP${C_R}"
+  local ip_direct ip_proxy
+  ip_direct="$(curl_direct --max-time 12 -s https://api.ipify.org || echo '')"
+  ip_proxy="$(curl_direct --max-time 20 -s -x "$PROXY_URL" https://api.ipify.org || echo '')"
+  echo "  напрямую:      ${ip_direct:-нет ответа}"
+  echo "  через туннель: ${ip_proxy:-нет ответа}"
+  if [[ -z "$ip_proxy" ]]; then
+    fail "через туннель наружу не вышли"; rc=1
+  elif [[ "$ip_proxy" == "$ip_direct" ]]; then
+    fail "IP совпадают — трафик идёт мимо туннеля"; rc=1
+  else
+    ok "туннель работает, IP отличается"
+  fi
+
+  echo "${C_B}4. split tunnel${C_R}"
+  if [[ -z "$BYPASS_DOMAINS" ]]; then
+    warn "список доменов в обход пуст — разделения фактически нет (задай BYPASS_DOMAINS в $ENV_FILE)"
+  else
+    local d
+    for d in ${BYPASS_DOMAINS//,/ }; do
+      local tag
+      tag="$(xst_python route-check "$CONFIG_JSON" "${d#.}" | cut -f1)"
+      if [[ "$tag" == "direct" ]]; then
+        ok "$d → direct (в обход туннеля)"
+      else
+        fail "$d → $tag — должен был идти мимо туннеля"; rc=1
+      fi
+      if grep -q "\.${d#.}" "$SHELL_SNIPPET" 2>/dev/null; then
+        ok "$d есть в NO_PROXY"
+      else
+        fail "$d нет в NO_PROXY ($SHELL_SNIPPET)"; rc=1
+      fi
+    done
+  fi
+  local tag_priv
+  tag_priv="$(xst_python route-check "$CONFIG_JSON" 192.168.1.1 | cut -f1)"
+  [[ "$tag_priv" == "direct" ]] && ok "приватные подсети → direct" || { fail "192.168.1.1 → $tag_priv"; rc=1; }
+
+  echo
+  [[ $rc == 0 ]] && log "проверка пройдена" || fail "есть проблемы (см. выше)"
+  return $rc
+}
+
+cmd_logs() {
+  echo "${C_B}$LOG_OUT${C_R}"; tail -n 20 "$LOG_OUT" 2>/dev/null || echo "  (пусто)"
+  echo "${C_B}$LOG_ERR${C_R}"; tail -n 20 "$LOG_ERR" 2>/dev/null || echo "  (пусто)"
+}
+
+cmd_env() {
+  echo "конфиг установки : $ENV_FILE"
+  echo "подписка         : $SUB_JSON"
+  echo "активный конфиг  : $CONFIG_JSON"
+  echo "shell-сниппет    : $SHELL_SNIPPET"
+  echo "LaunchAgent      : $PLIST"
+  echo "логи             : $LOG_OUT"
+  echo "прокси           : $PROXY_URL (socks5://127.0.0.1:$SOCKS_PORT)"
+}
+
+cmd_help() {
+  cat <<EOF
+xst — xray-split-tunnel
+
+  xst status              состояние сервиса, портов, сервера, правил обхода
+  xst list                серверы из подписки
+  xst switch <сервер>     переключиться (индекс или часть названия)
+  xst update              перекачать подписку и переприменить текущий сервер
+  xst apply               пересобрать конфиг из $ENV_FILE (после правки доменов)
+  xst check <домен|IP>    куда пойдёт хост: в обход или через туннель
+  xst run <команда>       запустить команду с HTTPS_PROXY на туннель
+  xst verify              полная проверка (конфиг, порты, IP, split tunnel)
+  xst restart|start|stop  управление сервисом
+  xst logs                хвост логов xray
+  xst env                 пути и порты
+
+Правила обхода правятся в $ENV_FILE (BYPASS_DOMAINS/BYPASS_CIDRS),
+после правки — xst apply.
+EOF
+}
+
+case "$cmd" in
+  list)          cmd_list ;;
+  switch)        cmd_apply "${1:-}" ;;
+  apply)         cmd_apply "${1:-}" ;;
+  update)        cmd_update ;;
+  restart)       cmd_restart ;;
+  start)         cmd_start ;;
+  stop|off)      cmd_stop ;;
+  status)        cmd_status ;;
+  check)         cmd_check "${1:-}" ;;
+  run)           cmd_run "$@" ;;
+  verify)        cmd_verify ;;
+  logs)          cmd_logs ;;
+  env|paths)     cmd_env ;;
+  help|-h|--help) cmd_help ;;
+  *) fail "неизвестная команда: $cmd"; cmd_help; exit 1 ;;
+esac
