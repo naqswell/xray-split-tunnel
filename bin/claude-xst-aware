@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Run Claude through XST and explicitly tell the session about routing policy.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  SELF_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$SELF_DIR/$SELF"
+done
+XST_ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
+
+exec "$XST_ROOT/bin/claude-xst" \
+  --append-system-prompt-file "$XST_ROOT/templates/claude-xst-instructions.md" \
+  "$@"

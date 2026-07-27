@@ -1,238 +1,820 @@
 #!/usr/bin/env bash
-# xst — управление xray-split-tunnel: серверы, сервис, проверки.
+# Runtime management and acceptance checks for xray-split-tunnel.
 set -euo pipefail
+umask 077
+
+# Never propagate legacy URL variables or confidential bypass policy to child
+# processes merely because the invoking shell exported names we also use.
+unset XST_SUB_URL SUB_URL subscription_url xst_secret_url escaped_url
+export -n BYPASS_DOMAINS BYPASS_CIDRS 2>/dev/null || true
 
 SELF="${BASH_SOURCE[0]}"
 while [[ -L "$SELF" ]]; do
-  _dir="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
   SELF="$(readlink "$SELF")"
-  [[ "$SELF" != /* ]] && SELF="$_dir/$SELF"
+  [[ "$SELF" != /* ]] && SELF="$SELF_DIR/$SELF"
 done
 XST_ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
 # shellcheck source=lib/common.sh
 source "$XST_ROOT/lib/common.sh"
-xst_load_env
 
-cmd="${1:-help}"
+COMMAND="${1:-help}"
 shift || true
 
-curl_direct() { env -u HTTPS_PROXY -u HTTP_PROXY -u https_proxy -u http_proxy curl "$@"; }
-
-# ── команды ─────────────────────────────────────────────────────────────────
-cmd_list() {
-  local cur=""
-  [[ -f "$STATE_FILE" ]] && cur="$(cat "$STATE_FILE")"
-  xst_python list "$SUB_JSON" --current "$cur"
-}
-
-cmd_apply() {
-  local idx="${1:-}"
-  [[ -n "$idx" ]] || { idx="0"; [[ -f "$STATE_FILE" ]] && idx="$(cat "$STATE_FILE")"; }
-  idx="$(xst_python resolve "$SUB_JSON" "$idx")"
-
-  local remarks
-  remarks="$(xst_python apply "$SUB_JSON" "$idx" "$CONFIG_JSON" \
-    --http-port "$HTTP_PORT" --socks-port "$SOCKS_PORT" \
-    --bypass-domains "$BYPASS_DOMAINS" --bypass-cidrs "$BYPASS_CIDRS")"
-  chmod 600 "$CONFIG_JSON"
-  echo "$idx" > "$STATE_FILE"
-  ok "конфиг собран: [$idx] $remarks"
-
-  "$XRAY_BIN" run -test -config "$CONFIG_JSON" >/dev/null 2>&1 \
-    || die "xray отверг конфиг: $("$XRAY_BIN" run -test -config "$CONFIG_JSON" 2>&1 | tail -3)"
-
-  xst_write_shell_snippet
-  cmd_restart
-}
-
-cmd_update() {
-  local url
-  [[ -f "$SUB_URL_FILE" ]] || die "нет $SUB_URL_FILE — перезапусти install.sh"
-  url="$(cat "$SUB_URL_FILE")"
-  log "скачиваю подписку…"
-  xst_fetch_subscription "$url" "$SUB_JSON" || die "curl не смог скачать подписку"
-  local count
-  count="$(xst_python normalize "$SUB_JSON.raw" "$SUB_JSON.new")"
-  rm -f "$SUB_JSON.raw"
-  mv "$SUB_JSON.new" "$SUB_JSON"
-  chmod 600 "$SUB_JSON"
-  ok "подписка обновлена: $count серверов"
-  warn "нумерация могла измениться — сверься с \`xst list\`"
-  cmd_apply
-}
-
-cmd_restart() {
-  xst_launchctl_reload "$LABEL" "$PLIST"
-  sleep 1
-  ok "$LABEL перезапущен"
-}
-
-cmd_stop() {
-  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
-  ok "$LABEL выгружен (туннель выключен)"
-}
-
-cmd_start() {
-  xst_launchctl_reload "$LABEL" "$PLIST"
-  ok "$LABEL загружен"
-}
-
-cmd_status() {
-  echo "${C_B}сервис${C_R}"
-  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
-    local pid
-    pid="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}')"
-    ok "$LABEL загружен${pid:+, pid $pid}"
-  else
-    fail "$LABEL не загружен"
-  fi
-
-  echo "${C_B}порты${C_R}"
-  xst_is_listening "$HTTP_PORT"  && ok "HTTP  127.0.0.1:$HTTP_PORT"  || fail "порт $HTTP_PORT не слушается"
-  xst_is_listening "$SOCKS_PORT" && ok "SOCKS 127.0.0.1:$SOCKS_PORT" || fail "порт $SOCKS_PORT не слушается"
-
-  echo "${C_B}сервер${C_R}"
-  if [[ -f "$STATE_FILE" && -f "$SUB_JSON" ]]; then
-    xst_python list "$SUB_JSON" --current "$(cat "$STATE_FILE")" | grep -- "<- активен" || echo "  (не определён)"
-  fi
-
-  echo "${C_B}в обход туннеля${C_R}"
-  echo "  домены: ${BYPASS_DOMAINS:-(нет)}"
-  echo "  подсети: приватные${BYPASS_CIDRS:+, $BYPASS_CIDRS}"
-}
-
-cmd_check() {
-  local host="${1:-}"
-  [[ -n "$host" ]] || die "usage: xst check <домен|IP>"
-  local out tag
-  out="$(xst_python route-check "$CONFIG_JSON" "$host")"
-  tag="$(echo "$out" | cut -f1)"
-  local why
-  why="$(echo "$out" | cut -f3)"
-  if [[ "$tag" == "direct" ]]; then
-    ok "$host → ${C_B}direct${C_R} (мимо туннеля), правило: $why"
-  elif [[ "$tag" == "block" ]]; then
-    warn "$host → block (заблокирован правилом $why)"
-  else
-    ok "$host → ${C_B}через туннель${C_R} ($tag, $why)"
-  fi
-}
-
-cmd_run() {
-  [[ $# -gt 0 ]] || die "usage: xst run <команда> [аргументы]"
-  HTTPS_PROXY="$PROXY_URL" HTTP_PROXY="$PROXY_URL" \
-  https_proxy="$PROXY_URL" http_proxy="$PROXY_URL" \
-  ALL_PROXY="socks5://127.0.0.1:$SOCKS_PORT" \
-  exec "$@"
-}
-
-cmd_verify() {
-  local rc=0
-
-  echo "${C_B}1. конфиг${C_R}"
-  if "$XRAY_BIN" run -test -config "$CONFIG_JSON" >/dev/null 2>&1; then
-    ok "Configuration OK"
-  else
-    fail "xray отверг конфиг"; rc=1
-  fi
-
-  echo "${C_B}2. сервис и порты${C_R}"
-  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && ok "$LABEL загружен" || { fail "$LABEL не загружен"; rc=1; }
-  xst_is_listening "$HTTP_PORT" && ok "порт $HTTP_PORT слушается" || { fail "порт $HTTP_PORT молчит — см. xst logs"; rc=1; }
-
-  echo "${C_B}3. выходной IP${C_R}"
-  local ip_direct ip_proxy
-  ip_direct="$(curl_direct --max-time 12 -s https://api.ipify.org || echo '')"
-  ip_proxy="$(curl_direct --max-time 20 -s -x "$PROXY_URL" https://api.ipify.org || echo '')"
-  echo "  напрямую:      ${ip_direct:-нет ответа}"
-  echo "  через туннель: ${ip_proxy:-нет ответа}"
-  if [[ -z "$ip_proxy" ]]; then
-    fail "через туннель наружу не вышли"; rc=1
-  elif [[ "$ip_proxy" == "$ip_direct" ]]; then
-    fail "IP совпадают — трафик идёт мимо туннеля"; rc=1
-  else
-    ok "туннель работает, IP отличается"
-  fi
-
-  echo "${C_B}4. split tunnel${C_R}"
-  if [[ -z "$BYPASS_DOMAINS" ]]; then
-    warn "список доменов в обход пуст — разделения фактически нет (задай BYPASS_DOMAINS в $ENV_FILE)"
-  else
-    local d
-    for d in ${BYPASS_DOMAINS//,/ }; do
-      local tag
-      tag="$(xst_python route-check "$CONFIG_JSON" "${d#.}" | cut -f1)"
-      if [[ "$tag" == "direct" ]]; then
-        ok "$d → direct (в обход туннеля)"
-      else
-        fail "$d → $tag — должен был идти мимо туннеля"; rc=1
-      fi
-      if grep -q "\.${d#.}" "$SHELL_SNIPPET" 2>/dev/null; then
-        ok "$d есть в NO_PROXY"
-      else
-        fail "$d нет в NO_PROXY ($SHELL_SNIPPET)"; rc=1
-      fi
-    done
-  fi
-  local tag_priv
-  tag_priv="$(xst_python route-check "$CONFIG_JSON" 192.168.1.1 | cut -f1)"
-  [[ "$tag_priv" == "direct" ]] && ok "приватные подсети → direct" || { fail "192.168.1.1 → $tag_priv"; rc=1; }
-
-  echo
-  [[ $rc == 0 ]] && log "проверка пройдена" || fail "есть проблемы (см. выше)"
-  return $rc
-}
-
-cmd_logs() {
-  echo "${C_B}$LOG_OUT${C_R}"; tail -n 20 "$LOG_OUT" 2>/dev/null || echo "  (пусто)"
-  echo "${C_B}$LOG_ERR${C_R}"; tail -n 20 "$LOG_ERR" 2>/dev/null || echo "  (пусто)"
-}
-
-cmd_env() {
-  echo "конфиг установки : $ENV_FILE"
-  echo "подписка         : $SUB_JSON"
-  echo "активный конфиг  : $CONFIG_JSON"
-  echo "shell-сниппет    : $SHELL_SNIPPET"
-  echo "LaunchAgent      : $PLIST"
-  echo "логи             : $LOG_OUT"
-  echo "прокси           : $PROXY_URL (socks5://127.0.0.1:$SOCKS_PORT)"
-}
-
-cmd_help() {
-  cat <<EOF
+print_help() {
+  cat <<'EOF'
 xst — xray-split-tunnel
 
-  xst status              состояние сервиса, портов, сервера, правил обхода
-  xst list                серверы из подписки
-  xst switch <сервер>     переключиться (индекс или часть названия)
-  xst update              перекачать подписку и переприменить текущий сервер
-  xst apply               пересобрать конфиг из $ENV_FILE (после правки доменов)
-  xst check <домен|IP>    куда пойдёт хост: в обход или через туннель
-  xst run <команда>       запустить команду с HTTPS_PROXY на туннель
-  xst verify              полная проверка (конфиг, порты, IP, split tunnel)
-  xst restart|start|stop  управление сервисом
-  xst logs                хвост логов xray
-  xst env                 пути и порты
+  xst status                 service/PID/listeners/config state
+  xst doctor                 offline production checks
+  xst list                   subscription servers
+  xst switch <index|name>    atomically switch server
+  xst update                 atomically update, preserving exact server identity
+  xst apply                  atomically rebuild after env changes
+  xst check <domain|IP>      offline route explanation
+  xst run <command>          command with proxy and generated NO_PROXY
+  xst verify                 full XRay acceptance, including live egress
+  xst restart|start|stop     service lifecycle
+  xst logs                   redacted log tail
+  xst env                    non-secret paths and versions
 
-Правила обхода правятся в $ENV_FILE (BYPASS_DOMAINS/BYPASS_CIDRS),
-после правки — xst apply.
+Citrix acceptance is separate; see docs/citrix-prerequisites.md.
 EOF
 }
 
-case "$cmd" in
-  list)          cmd_list ;;
-  switch)        cmd_apply "${1:-}" ;;
-  apply)         cmd_apply "${1:-}" ;;
-  update)        cmd_update ;;
-  restart)       cmd_restart ;;
-  start)         cmd_start ;;
-  stop|off)      cmd_stop ;;
-  status)        cmd_status ;;
-  check)         cmd_check "${1:-}" ;;
-  run)           cmd_run "$@" ;;
-  verify)        cmd_verify ;;
-  logs)          cmd_logs ;;
-  env|paths)     cmd_env ;;
-  help|-h|--help) cmd_help ;;
-  *) fail "неизвестная команда: $cmd"; cmd_help; exit 1 ;;
+case "$COMMAND" in
+  help|-h|--help)
+    print_help
+    exit 0
+    ;;
 esac
+
+if [[ -e "$OPERATION_LOCK_DIR" || -L "$OPERATION_LOCK_DIR" ]]; then
+  die "XST state удерживается другой операцией; lock автоматически не удаляется"
+fi
+case "$COMMAND" in
+  stop|off)
+    xst_validate_state_path && xst_check_managed_marker ||
+      die "managed state identity не доказана; target не остановлен"
+    ;;
+  apply)
+    xst_audit_state_home ||
+      die "runtime state не прошёл owner/mode/marker audit; сначала переустанови XST"
+    ;;
+  *)
+    xst_audit_state_home_applied_runtime ||
+      die "applied runtime state не прошёл owner/mode/marker audit"
+    ;;
+esac
+xst_check_owned_file "$APPLIED_ENV_FILE" 600 ||
+  die "нет доказанных applied settings; повторно запусти install.sh"
+if [[ "$COMMAND" == apply ]]; then
+  xst_check_owned_file "$ENV_FILE" 600 ||
+    die "env не прошёл owner/mode/symlink проверку"
+fi
+
+RUNTIME_TMP=""
+RUNTIME_TRANSACTION_ACTIVE=0
+RUNTIME_TRANSACTION_SNAPSHOT=""
+PRESERVE_RUNTIME_TMP=0
+cleanup_runtime() {
+  local rollback_rc=0
+  trap '' HUP INT TERM
+  if [[ "${RUNTIME_TRANSACTION_ACTIVE:-0}" == 1 ]] &&
+    type restore_runtime_transaction >/dev/null 2>&1; then
+    warn "операция прервана; восстанавливаю последнюю применённую конфигурацию"
+    set +e
+    restore_runtime_transaction "$RUNTIME_TRANSACTION_SNAPSHOT"
+    rollback_rc=$?
+    RUNTIME_TRANSACTION_ACTIVE=0
+    if [[ $rollback_rc -eq 0 ]]; then
+      warn "предыдущая конфигурация доказанно восстановлена"
+    else
+      PRESERVE_RUNTIME_TMP=1
+      fail "автоматический rollback не доказан; snapshot сохранён: $RUNTIME_TMP"
+    fi
+  fi
+  if type xst_release_operation_lock >/dev/null 2>&1 &&
+    [[ -n "${XST_OPERATION_LOCK_TOKEN:-}" ]]; then
+    xst_release_operation_lock >/dev/null 2>&1 || true
+  fi
+  if [[ "${PRESERVE_RUNTIME_TMP:-0}" != 1 &&
+        -n "${RUNTIME_TMP:-}" &&
+        "$RUNTIME_TMP" == "${TMPDIR:-/tmp}"/xst-runtime.* ]]; then
+    rm -rf "$RUNTIME_TMP"
+  fi
+}
+trap cleanup_runtime EXIT
+trap 'exit 130' HUP INT TERM
+
+case "$COMMAND" in
+  stop|off)
+    xst_acquire_operation_lock minimal ||
+      die "другая state-changing операция уже выполняется; lock не удалялся"
+    ;;
+  apply)
+    xst_acquire_operation_lock ||
+      die "другая state-changing операция уже выполняется; lock не удалялся"
+    ;;
+  switch|update|restart|start)
+    xst_acquire_operation_lock applied ||
+      die "другая state-changing операция уже выполняется; lock не удалялся"
+    ;;
+esac
+
+ENV_PENDING=0
+PENDING_ENV_VALID=0
+if xst_check_owned_file "$ENV_FILE" 600 >/dev/null 2>&1; then
+  PENDING_ENV_VALID=1
+  cmp -s "$ENV_FILE" "$APPLIED_ENV_FILE" || ENV_PENDING=1
+else
+  ENV_PENDING=1
+fi
+
+load_applied_runtime() {
+  local require_xray="${1:-1}" pending_env_file="$ENV_FILE"
+  ENV_FILE="$APPLIED_ENV_FILE"
+  if ! xst_read_env || ! xst_validate_settings "$require_xray"; then
+    ENV_FILE="$pending_env_file"
+    return 1
+  fi
+  xst_set_service_paths
+  ENV_FILE="$pending_env_file"
+}
+
+case "$COMMAND" in
+  apply)
+    xst_load_env
+    ;;
+  stop|off)
+    load_applied_runtime 0 ||
+      die "applied.env не прошёл service identity validation"
+    if [[ "$ENV_PENDING" == 1 ]]; then
+      if [[ "$PENDING_ENV_VALID" == 1 ]]; then
+        warn "env содержит неприменённые изменения; stop использует applied.env"
+      else
+        warn "pending env отсутствует или небезопасен; stop использует applied.env"
+      fi
+    fi
+    ;;
+  switch|update)
+    load_applied_runtime ||
+      die "applied.env не прошёл runtime settings validation"
+    [[ "$ENV_PENDING" == 0 ]] ||
+      die "env содержит неприменённые изменения; сначала выполни xst apply"
+    ;;
+  *)
+    load_applied_runtime ||
+      die "applied.env не прошёл runtime settings validation"
+    if [[ "$ENV_PENDING" == 1 ]]; then
+      if [[ "$PENDING_ENV_VALID" == 1 ]]; then
+        warn "env содержит неприменённые изменения; команда использует applied.env"
+      else
+        warn "pending env отсутствует или небезопасен; команда использует applied.env"
+      fi
+    fi
+    ;;
+esac
+
+if [[ "$COMMAND" == apply ]]; then
+  APPLIED_IDENTITY="$(
+    (
+      LABEL="$DEFAULT_LABEL"
+      HTTP_PORT="$DEFAULT_HTTP_PORT"
+      SOCKS_PORT="$DEFAULT_SOCKS_PORT"
+      BYPASS_DOMAINS=""
+      BYPASS_CIDRS=""
+      XRAY_BIN=""
+      XRAY_VERSION=""
+      EXPORT_HTTPS_PROXY=0
+      SUB_UA="$DEFAULT_UA"
+      SERVICE_SCOPE="$DEFAULT_SERVICE_SCOPE"
+      INSTALL_VERSION=""
+      INSTALL_REVISION=""
+      ENV_FILE="$APPLIED_ENV_FILE"
+      xst_read_env
+      xst_validate_settings 1
+      printf '%s\t%s\t%s\n' "$LABEL" "$SERVICE_SCOPE" "$XRAY_BIN"
+    )
+  )"
+  CURRENT_IDENTITY="$(printf '%s\t%s\t%s\n' "$LABEL" "$SERVICE_SCOPE" "$XRAY_BIN")"
+  [[ "$APPLIED_IDENTITY" == "$CURRENT_IDENTITY" ]] ||
+    die "label, scope и XRAY_BIN меняются только повторным install.sh"
+fi
+
+case "$COMMAND" in
+  switch|apply|update|doctor|verify)
+    RUNTIME_TMP="$(mktemp -d "${TMPDIR:-/tmp}/xst-runtime.XXXXXX")"
+    chmod 700 "$RUNTIME_TMP"
+    ;;
+esac
+
+xst_runtime_tmp() {
+  [[ -n "$RUNTIME_TMP" ]] || die "internal error: runtime temp is unavailable"
+  printf '%s\n' "$RUNTIME_TMP"
+}
+
+curl_direct() {
+  env \
+    -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY \
+    -u https_proxy -u http_proxy -u all_proxy \
+    -u NO_PROXY -u no_proxy \
+    curl -q "$@"
+}
+
+valid_ip() {
+  printf '%s' "$1" |
+    python3 -c 'import ipaddress,sys; ipaddress.ip_address(sys.stdin.read())' \
+      >/dev/null 2>&1
+}
+
+production_runtime_files_are_valid() {
+  local config_ports
+  xst_check_plist_permissions || return 1
+  xst_plist_matches_runtime 1 || return 1
+  xst_check_owned_file "$CONFIG_JSON" 600 || return 1
+  xst_check_owned_file "$LOG_OUT" 600 || return 1
+  xst_check_owned_file "$LOG_ERR" 600 || return 1
+  config_ports="$(xst_python config-ports "$CONFIG_JSON")" || return 1
+  [[ "$config_ports" == "$HTTP_PORT"$'\t'"$SOCKS_PORT" ]]
+}
+
+restart_and_prove() {
+  local require_existing_hash="${1:-0}"
+  production_runtime_files_are_valid || return 1
+  "$XRAY_BIN" run -test -config "$CONFIG_JSON" >/dev/null 2>&1 || return 1
+  if [[ "$require_existing_hash" == 1 ]]; then
+    xst_active_config_is_proven || return 1
+  fi
+  xst_launchctl_reload "$PLIST" || return 1
+  xst_wait_for_service 40 >/dev/null || return 1
+  xst_write_active_hash
+}
+
+restore_runtime_transaction() {
+  local snapshot="$1" managed_name rc=0
+  local pending_env_snapshot="$snapshot/env"
+
+  for managed_name in applied.env sub-url subscription.json config.json current-index active-config.sha256 shell.sh; do
+    if [[ -f "$snapshot/$managed_name" ]]; then
+      if ! xst_atomic_from_stdin "$XST_HOME/$managed_name" 600 < "$snapshot/$managed_name"; then
+        warn "не удалось восстановить $managed_name"
+        rc=1
+      fi
+    else
+      if ! rm -f "$XST_HOME/$managed_name"; then
+        warn "не удалось удалить новый $managed_name"
+        rc=1
+      fi
+    fi
+  done
+
+  # Restart with the last proven settings even when env contains a pending
+  # port/bypass edit that caused this apply to fail.
+  if [[ -f "$snapshot/applied.env" ]]; then
+    if ! xst_atomic_from_stdin "$ENV_FILE" 600 < "$snapshot/applied.env"; then
+      warn "не удалось временно восстановить applied env"
+      rc=1
+    elif ! xst_load_env; then
+      warn "восстановленный applied env не прошёл проверку"
+      rc=1
+    elif ! restart_and_prove 1; then
+      warn "предыдущий сервис не прошёл proof после rollback"
+      rc=1
+    fi
+  else
+    warn "snapshot не содержит applied.env"
+    rc=1
+  fi
+
+  # Keep the operator's pending env edit after proving the old runtime.
+  if [[ -f "$pending_env_snapshot" ]]; then
+    if ! xst_atomic_from_stdin "$ENV_FILE" 600 < "$pending_env_snapshot"; then
+      warn "не удалось вернуть pending env после rollback"
+      rc=1
+    fi
+  else
+    warn "snapshot не содержит env"
+    rc=1
+  fi
+  return "$rc"
+}
+
+runtime_transaction_failed() {
+  local reason="$1" rollback_rc=0
+  restore_runtime_transaction "$RUNTIME_TRANSACTION_SNAPSHOT" || rollback_rc=$?
+  RUNTIME_TRANSACTION_ACTIVE=0
+  if [[ "$rollback_rc" == 0 ]]; then
+    die "$reason; предыдущая конфигурация доказанно восстановлена"
+  fi
+  PRESERVE_RUNTIME_TMP=1
+  die "$reason; rollback НЕ доказан, защищённый snapshot сохранён: $RUNTIME_TRANSACTION_SNAPSHOT"
+}
+
+apply_transaction() {
+  local source_subscription="$1" requested_index="$2" replace_subscription="${3:-0}"
+  local work snapshot resolved_index remarks managed_name
+  work="$(xst_runtime_tmp)"
+  snapshot="$work/snapshot"
+  mkdir -p "$snapshot"
+
+  resolved_index="$(xst_python resolve "$source_subscription" "$requested_index")"
+  remarks="$(xst_emit_bypass_inputs |
+    xst_python apply \
+      "$source_subscription" \
+      "$resolved_index" \
+      "$work/config.new.json" \
+      --http-port "$HTTP_PORT" \
+      --socks-port "$SOCKS_PORT" \
+      --bypass-stdin)"
+  if ! "$XRAY_BIN" run -test -config "$work/config.new.json" >/dev/null 2>&1; then
+    die "xray отверг новый config; текущий config не изменён"
+  fi
+
+  for managed_name in env applied.env sub-url subscription.json config.json current-index active-config.sha256 shell.sh; do
+    if [[ -f "$XST_HOME/$managed_name" ]]; then
+      cp -p "$XST_HOME/$managed_name" "$snapshot/$managed_name" ||
+        die "не удалось создать snapshot $managed_name; runtime не изменён"
+    fi
+  done
+
+  RUNTIME_TRANSACTION_SNAPSHOT="$snapshot"
+  RUNTIME_TRANSACTION_ACTIVE=1
+
+  if [[ "$replace_subscription" == 1 ]] &&
+    ! xst_atomic_from_stdin "$SUB_JSON" 600 < "$source_subscription"; then
+    runtime_transaction_failed "не удалось атомарно заменить subscription"
+  fi
+  if ! xst_atomic_from_stdin "$CONFIG_JSON" 600 < "$work/config.new.json"; then
+    runtime_transaction_failed "не удалось атомарно заменить config"
+  fi
+  if ! printf '%s\n' "$resolved_index" | xst_atomic_from_stdin "$STATE_FILE" 600; then
+    runtime_transaction_failed "не удалось атомарно заменить current-index"
+  fi
+  if ! xst_write_shell_snippet; then
+    runtime_transaction_failed "не удалось атомарно обновить shell snippet"
+  fi
+  if ! restart_and_prove; then
+    runtime_transaction_failed "новая конфигурация не прошла runtime proof"
+  fi
+  if ! xst_atomic_from_stdin "$APPLIED_ENV_FILE" 600 < "$ENV_FILE"; then
+    runtime_transaction_failed "не удалось зафиксировать applied settings"
+  fi
+  RUNTIME_TRANSACTION_ACTIVE=0
+  ok "активирован сервер [$resolved_index] $remarks"
+}
+
+cmd_list() {
+  local current=""
+  [[ -f "$STATE_FILE" ]] && IFS= read -r current < "$STATE_FILE"
+  xst_python list "$SUB_JSON" --current "$current"
+}
+
+cmd_apply() {
+  local selection="${1:-}"
+  if [[ -z "$selection" ]]; then
+    selection="0"
+    [[ -f "$STATE_FILE" ]] && IFS= read -r selection < "$STATE_FILE"
+  fi
+  apply_transaction "$SUB_JSON" "$selection" 0
+}
+
+cmd_update() {
+  local work current_index current_identity count new_index config_index
+  xst_check_secret_file "$SUB_URL_FILE" 600 ||
+    die "эта установка не имеет защищённого sub-url; обнови локальный XST_SUB_FILE вручную"
+  [[ -f "$STATE_FILE" ]] || die "нет current-index"
+  xst_active_config_is_proven ||
+    die "active config/hash не совпадают; сначала восстанови состояние через xst apply"
+  IFS= read -r current_index < "$STATE_FILE"
+  work="$(xst_runtime_tmp)"
+  xst_emit_bypass_inputs |
+    xst_python apply \
+      "$SUB_JSON" \
+      "$current_index" \
+      "$work/current.expected.json" \
+      --http-port "$HTTP_PORT" \
+      --socks-port "$SOCKS_PORT" \
+      --bypass-stdin >/dev/null
+  cmp -s "$work/current.expected.json" "$CONFIG_JSON" ||
+    die "current-index/subscription не воспроизводят active config; update отменён"
+  current_identity="$(xst_python identity "$SUB_JSON" "$current_index")"
+
+  local subscription_url=""
+  export -n subscription_url 2>/dev/null || true
+  xst_read_secret_url_file "$SUB_URL_FILE" subscription_url ||
+    die "сохранённый sub-url некорректен"
+  log "скачиваю подписку по HTTPS-only policy…"
+  xst_fetch_subscription "$subscription_url" "$work/subscription.raw" ||
+    die "не удалось скачать подписку; текущая версия сохранена"
+  count="$(xst_python normalize "$work/subscription.raw" "$work/subscription.new.json")"
+  new_index="$(xst_python resolve-identity \
+    "$work/subscription.new.json" "$current_identity")" ||
+    die "активный сервер больше не определяется однозначно; подписка не изменена"
+
+  for ((config_index = 0; config_index < count; config_index++)); do
+    xst_emit_bypass_inputs |
+      xst_python apply \
+        "$work/subscription.new.json" \
+        "$config_index" \
+        "$work/update-config-$config_index.json" \
+        --http-port "$HTTP_PORT" \
+        --socks-port "$SOCKS_PORT" \
+        --bypass-stdin >/dev/null
+    "$XRAY_BIN" run -test -config "$work/update-config-$config_index.json" >/dev/null 2>&1 ||
+      die "новая подписка содержит config, который xray отвергает; обновление отменено"
+  done
+  apply_transaction "$work/subscription.new.json" "$new_index" 1
+  ok "подписка обновлена: $count конфигов, сохранён тот же сервер"
+}
+
+cmd_restart() {
+  if ! restart_and_prove 1; then
+    die "не удалось перезапустить $SERVICE_TARGET"
+  fi
+  ok "$SERVICE_TARGET перезапущен"
+}
+
+cmd_stop() {
+  local pid
+  xst_check_plist_permissions ||
+    die "ownership plist не доказан; target не остановлен"
+  xst_plist_matches_runtime 1 ||
+    die "exact applied plist identity/hardening не доказаны; target не остановлен"
+  if xst_launchctl_target_exists "$SERVICE_TARGET"; then
+    pid="$(xst_service_pid || true)"
+    if [[ -n "$pid" ]] && ! xst_process_matches_runtime "$pid"; then
+      die "live process не совпадает с exact applied executable/argv/uid"
+    fi
+  fi
+  if ! xst_launchctl_bootout_verified "$SERVICE_TARGET"; then
+    die "не удалось доказанно остановить $SERVICE_TARGET"
+  fi
+  ok "$SERVICE_TARGET остановлен"
+}
+
+cmd_start() {
+  [[ -f "$PLIST" ]] || die "plist не найден: $PLIST"
+  if ! restart_and_prove 1; then
+    die "не удалось запустить $SERVICE_TARGET"
+  fi
+  ok "$SERVICE_TARGET запущен"
+}
+
+cmd_status() {
+  local rc=0 pid="" expected_hash="" actual_hash=""
+  echo "${C_B}сервис${C_R}"
+  if xst_launchctl_target_exists "$SERVICE_TARGET"; then
+    pid="$(xst_service_pid || true)"
+    if [[ -n "$pid" ]] && xst_process_matches_runtime "$pid"; then
+      ok "$SERVICE_TARGET, точный executable/argv/uid подтверждён, pid $pid"
+    else
+      fail "$SERVICE_TARGET загружен, но executable/argv/uid процесса не совпадают"
+      rc=1
+    fi
+  else
+    fail "$SERVICE_TARGET не загружен"
+    rc=1
+  fi
+  if production_runtime_files_are_valid; then
+    ok "plist, config ports и защищённые log paths соответствуют runtime"
+  else
+    fail "plist/config/log hardening не соответствует runtime settings"
+    rc=1
+  fi
+
+  echo "${C_B}listeners${C_R}"
+  for port in "$HTTP_PORT" "$SOCKS_PORT"; do
+    if [[ -n "$pid" ]] && xst_is_loopback_listener_by_pid "$port" "$pid"; then
+      ok "xray pid $pid слушает 127.0.0.1:$port"
+    else
+      fail "ожидаемый xray не слушает 127.0.0.1:$port"
+      rc=1
+    fi
+  done
+
+  echo "${C_B}config${C_R}"
+  if [[ -f "$CONFIG_JSON" && -f "$ACTIVE_HASH_FILE" ]]; then
+    IFS= read -r expected_hash < "$ACTIVE_HASH_FILE"
+    actual_hash="$(xst_config_hash "$CONFIG_JSON")"
+    if [[ -n "$expected_hash" && "$expected_hash" == "$actual_hash" ]]; then
+      ok "live marker соответствует config на диске"
+    else
+      fail "config изменён без успешного restart/apply"
+      rc=1
+    fi
+  else
+    fail "нет config или active hash"
+    rc=1
+  fi
+
+  if [[ -n "$XRAY_VERSION" ]]; then
+    local current_version
+    current_version="$("$XRAY_BIN" version 2>/dev/null | awk 'NR==1{print $2}')"
+    if [[ "$current_version" == "$XRAY_VERSION" ]]; then
+      ok "xray version $current_version"
+    else
+      warn "xray изменился: установлено $XRAY_VERSION, сейчас $current_version; повтори verify"
+    fi
+  fi
+  return "$rc"
+}
+
+cmd_check() {
+  local host="${1:-}" output tag reason
+  [[ -n "$host" ]] || die "usage: xst check <domain|IP>"
+  output="$(xst_route_check "$CONFIG_JSON" "$host")"
+  tag="$(printf '%s\n' "$output" | cut -f1)"
+  reason="$(printf '%s\n' "$output" | cut -f3)"
+  case "$tag" in
+    direct) ok "$host → direct ($reason)" ;;
+    block) warn "$host → block ($reason)" ;;
+    *) ok "$host → XRay outbound $tag ($reason)" ;;
+  esac
+}
+
+cmd_run() {
+  local managed_no_proxy no_proxy_value
+  [[ $# -gt 0 ]] || die "usage: xst run <command> [args...]"
+  managed_no_proxy="$(xst_no_proxy_value)"
+  no_proxy_value="$(xst_merge_no_proxy_values \
+    "${NO_PROXY:-}" "${no_proxy:-}" "$managed_no_proxy")"
+  HTTPS_PROXY="$PROXY_URL" \
+    HTTP_PROXY="$PROXY_URL" \
+    https_proxy="$PROXY_URL" \
+    http_proxy="$PROXY_URL" \
+    ALL_PROXY="socks5://127.0.0.1:$SOCKS_PORT" \
+    all_proxy="socks5://127.0.0.1:$SOCKS_PORT" \
+    NO_PROXY="$no_proxy_value" \
+    no_proxy="$no_proxy_value" \
+    exec "$@"
+}
+
+verify_offline() {
+  local rc=0 expected_shell domain tag cidr probe
+  echo "${C_B}1. config и state${C_R}"
+  if "$XRAY_BIN" run -test -config "$CONFIG_JSON" >/dev/null 2>&1; then
+    ok "xray принял активный config"
+  else
+    fail "xray отверг активный config"
+    rc=1
+  fi
+  cmd_status || rc=1
+
+  expected_shell="$(xst_runtime_tmp)/shell.expected"
+  if xst_render_shell_snippet > "$expected_shell" && cmp -s "$expected_shell" "$SHELL_SNIPPET"; then
+    ok "shell snippet соответствует env"
+  else
+    fail "shell snippet устарел или изменён"
+    rc=1
+  fi
+
+  echo "${C_B}2. routing bypass${C_R}"
+  if [[ -n "$BYPASS_DOMAINS" ]]; then
+    for domain in ${BYPASS_DOMAINS//,/ }; do
+      tag="$(xst_route_check "$CONFIG_JSON" "$domain" | cut -f1)"
+      if [[ "$tag" == direct ]]; then
+        ok "подтверждён domain bypass"
+      else
+        fail "один из domain bypass не ведёт в direct"
+        rc=1
+      fi
+    done
+  else
+    warn "пользовательские domain bypass отсутствуют"
+  fi
+
+  tag="$(xst_route_check "$CONFIG_JSON" 192.168.1.1 | cut -f1)"
+  if [[ "$tag" == direct ]]; then
+    ok "RFC1918 → direct"
+  else
+    fail "RFC1918 не ведёт в direct"
+    rc=1
+  fi
+
+  for cidr in ${BYPASS_CIDRS//,/ }; do
+    probe="$(printf '%s' "$cidr" |
+      python3 -c 'import ipaddress,sys; n=ipaddress.ip_network(sys.stdin.read()); print(next(n.hosts(), n.network_address))')"
+    tag="$(xst_route_check "$CONFIG_JSON" "$probe" | cut -f1)"
+    if [[ "$tag" == direct ]]; then
+      ok "подтверждён CIDR bypass"
+    else
+      fail "один из CIDR bypass не ведёт в direct"
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+cmd_doctor() {
+  local rc=0 state_name alternate_plist alternate_target saved_url=""
+  verify_offline || rc=1
+
+  if xst_audit_state_home; then
+    ok "XST_HOME owner/mode/marker/contents прошли audit"
+  else
+    rc=1
+  fi
+  for state_name in env applied.env subscription.json config.json current-index active-config.sha256 shell.sh; do
+    xst_check_owned_file "$XST_HOME/$state_name" 600 || rc=1
+  done
+  if [[ -e "$SUB_URL_FILE" || -L "$SUB_URL_FILE" ]]; then
+    if xst_check_owned_file "$SUB_URL_FILE" 600; then
+      IFS= read -r saved_url < "$SUB_URL_FILE" || [[ -n "$saved_url" ]] || rc=1
+      if [[ -n "$saved_url" ]] && printf '%s' "$saved_url" | xst_validate_https_url; then
+        ok "sub-url защищён и соответствует HTTPS-only policy"
+      else
+        fail "sub-url не прошёл HTTPS-only проверку"
+        rc=1
+      fi
+    else
+      rc=1
+    fi
+  else
+    ok "sub-url отсутствует: установка использует локальную подписку"
+  fi
+
+  if [[ "$SERVICE_SCOPE" == system ]]; then
+    alternate_plist="$HOME/Library/LaunchAgents/$LABEL.plist"
+    alternate_target="gui/$(id -u)/$LABEL"
+  else
+    alternate_plist="/Library/LaunchDaemons/$LABEL.plist"
+    alternate_target="system/$LABEL"
+  fi
+  if [[ -e "$alternate_plist" || -L "$alternate_plist" ]] ||
+    xst_launchctl_target_exists "$alternate_target"; then
+    fail "обнаружен тот же label в противоположном launchd scope"
+    rc=1
+  else
+    ok "противоположный launchd scope свободен"
+  fi
+
+  if [[ "$PENDING_ENV_VALID" != 1 ]]; then
+    fail "pending env отсутствует или небезопасен; runtime проверен только по applied.env"
+    rc=1
+  elif cmp -s "$ENV_FILE" "$APPLIED_ENV_FILE"; then
+    ok "env совпадает с последними применёнными settings"
+  else
+    fail "env содержит неприменённые settings; сначала выполни xst apply"
+    rc=1
+  fi
+  [[ "$rc" == 0 ]] && log "offline doctor пройден" || fail "offline doctor нашёл проблемы"
+  return "$rc"
+}
+
+cmd_verify() {
+  local rc=0 direct_ip proxy_ip socks_ip check_url
+  verify_offline || rc=1
+  if [[ "$ENV_PENDING" == 1 ]]; then
+    fail "verify не подтверждает pending env; сначала восстанови env и выполни xst apply"
+    rc=1
+  fi
+
+  echo "${C_B}3. live egress${C_R}"
+  check_url="${XST_IP_CHECK_URL:-https://api.ipify.org}"
+  if ! printf '%s' "$check_url" | xst_validate_https_url; then
+    fail "XST_IP_CHECK_URL должен быть HTTPS"
+    rc=1
+    direct_ip=""
+    proxy_ip=""
+    socks_ip=""
+  else
+    direct_ip="$(curl_direct --max-time 15 --fail --silent --show-error "$check_url" 2>/dev/null || true)"
+    proxy_ip="$(curl_direct --max-time 25 --fail --silent --show-error --proxy "$PROXY_URL" "$check_url" 2>/dev/null || true)"
+    socks_ip="$(curl_direct --max-time 25 --fail --silent --show-error \
+      --proxy "socks5h://127.0.0.1:$SOCKS_PORT" "$check_url" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$direct_ip" ]] && valid_ip "$direct_ip"; then
+    ok "direct IP получен и валиден (значение скрыто)"
+  else
+    fail "direct IP отсутствует или невалиден"
+    rc=1
+  fi
+  if [[ -n "$proxy_ip" ]] && valid_ip "$proxy_ip"; then
+    ok "HTTP proxy IP получен и валиден (значение скрыто)"
+  else
+    fail "HTTP proxy IP отсутствует или невалиден"
+    rc=1
+  fi
+  if [[ -n "$socks_ip" ]] && valid_ip "$socks_ip"; then
+    ok "SOCKS5 proxy IP получен и валиден (значение скрыто)"
+  else
+    fail "SOCKS5 proxy IP отсутствует или невалиден"
+    rc=1
+  fi
+  if [[ -n "$direct_ip" && -n "$proxy_ip" && "$direct_ip" != "$proxy_ip" ]]; then
+    ok "direct и HTTP proxy IP различаются"
+  else
+    fail "различие direct/HTTP proxy IP не доказано"
+    rc=1
+  fi
+  if [[ -n "$direct_ip" && -n "$socks_ip" && "$direct_ip" != "$socks_ip" ]]; then
+    ok "direct и SOCKS5 proxy IP различаются"
+  else
+    fail "различие direct/SOCKS5 proxy IP не доказано"
+    rc=1
+  fi
+
+  echo
+  if [[ "$rc" == 0 ]]; then
+    log "XRay verification пройдена"
+    warn "Citrix требует отдельной ручной приёмки; этот exit code её не подтверждает"
+  else
+    fail "verification не пройдена"
+  fi
+  return "$rc"
+}
+
+cmd_logs() {
+  local log_file
+  for log_file in "$LOG_OUT" "$LOG_ERR"; do
+    xst_check_owned_file "$log_file" 600 ||
+      die "log path не прошёл owner/mode/symlink проверку; чтение запрещено"
+  done
+  echo "${C_B}redacted logs${C_R}"
+  echo "  $LOG_OUT"
+  echo "  $LOG_ERR"
+  xst_python redact-log "$LOG_OUT" "$LOG_ERR" --lines 20
+}
+
+cmd_env() {
+  printf 'version          : %s (%s)\n' "${INSTALL_VERSION:-unknown}" "${INSTALL_REVISION:-unknown}"
+  printf 'service          : %s\n' "$SERVICE_TARGET"
+  printf 'settings         : %s\n' "$ENV_FILE"
+  printf 'subscription     : %s\n' "$SUB_JSON"
+  printf 'active config    : %s\n' "$CONFIG_JSON"
+  printf 'shell snippet    : %s\n' "$SHELL_SNIPPET"
+  printf 'plist            : %s\n' "$PLIST"
+  printf 'logs             : %s, %s\n' "$LOG_OUT" "$LOG_ERR"
+  printf 'proxy            : %s, socks5://127.0.0.1:%s\n' "$PROXY_URL" "$SOCKS_PORT"
+}
+
+case "$COMMAND" in
+  list)
+    [[ $# -eq 0 ]] || die "usage: xst list"
+    cmd_list
+    ;;
+  switch)
+    [[ $# -eq 1 ]] || die "usage: xst switch <index|exact-or-unique-name>"
+    cmd_apply "$1"
+    ;;
+  apply)
+    [[ $# -le 1 ]] || die "usage: xst apply [index|exact-or-unique-name]"
+    cmd_apply "${1:-}"
+    ;;
+  update)
+    [[ $# -eq 0 ]] || die "usage: xst update"
+    cmd_update
+    ;;
+  restart)
+    [[ $# -eq 0 ]] || die "usage: xst restart"
+    cmd_restart
+    ;;
+  start)
+    [[ $# -eq 0 ]] || die "usage: xst start"
+    cmd_start
+    ;;
+  stop|off)
+    [[ $# -eq 0 ]] || die "usage: xst stop"
+    cmd_stop
+    ;;
+  status)
+    [[ $# -eq 0 ]] || die "usage: xst status"
+    cmd_status
+    ;;
+  doctor)
+    [[ $# -eq 0 ]] || die "usage: xst doctor"
+    cmd_doctor
+    ;;
+  check)
+    [[ $# -eq 1 ]] || die "usage: xst check <domain|IP>"
+    cmd_check "$1"
+    ;;
+  run)
+    [[ $# -gt 0 ]] || die "usage: xst run <command> [args...]"
+    cmd_run "$@"
+    ;;
+  verify)
+    [[ $# -eq 0 ]] || die "usage: xst verify"
+    cmd_verify
+    ;;
+  logs)
+    [[ $# -eq 0 ]] || die "usage: xst logs"
+    cmd_logs
+    ;;
+  env|paths)
+    [[ $# -eq 0 ]] || die "usage: xst env"
+    cmd_env
+    ;;
+  *)
+    fail "неизвестная команда: $COMMAND"
+    print_help
+    exit 1
+    ;;
+esac
+
+if [[ -n "${XST_OPERATION_LOCK_TOKEN:-}" ]]; then
+  xst_release_operation_lock ||
+    die "операция завершилась, но owner lock не удалось доказанно снять"
+fi

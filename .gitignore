@@ -1,0 +1,40 @@
+# macOS / editors
+.DS_Store
+*.swp
+*.swo
+*~
+
+# Python tooling
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+
+# Local test and runtime output
+/.tmp/
+/coverage/
+/dist/
+/*.log
+
+# Runtime secrets accidentally created in the repository root
+/.env
+/env
+/applied.env
+/sub-url
+/subscription.json
+/config.json
+/current-index
+/active-config.sha256
+/shell.sh
+/.xst-managed
+/.xst-operation.lock/
+
+# Private keys and exported identities must never enter Git
+*.key
+*.pem
+*.p12
+*.pfx
+*.cer
+*.crt

@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Run Claude Code with the XST proxy environment without changing global shell state.
+set -euo pipefail
+
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  SELF_DIR="$(cd -P "$(dirname "$SELF")" && pwd)"
+  SELF="$(readlink "$SELF")"
+  [[ "$SELF" != /* ]] && SELF="$SELF_DIR/$SELF"
+done
+XST_ROOT="$(cd -P "$(dirname "$SELF")/.." && pwd)"
+
+command -v claude >/dev/null 2>&1 || {
+  printf 'claude-xst: команда claude не найдена в PATH\n' >&2
+  exit 127
+}
+
+# Keep hostnames visible to the HTTP proxy so XST domain routing remains
+# deterministic. This base command does not add anything to Claude's context.
+export CLAUDE_CODE_PROXY_RESOLVES_HOSTS=1
+exec "$XST_ROOT/bin/xst" run claude "$@"

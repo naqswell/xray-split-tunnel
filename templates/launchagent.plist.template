@@ -30,6 +30,10 @@
     <key>ThrottleInterval</key>
     <integer>10</integer>
 
+    <!-- Protect launchd-created stdout/stderr because endpoints may be sensitive. -->
+    <key>Umask</key>
+    <integer>63</integer>
+
     <key>StandardOutPath</key>
     <string>__LOG_OUT__</string>
     <key>StandardErrorPath</key>

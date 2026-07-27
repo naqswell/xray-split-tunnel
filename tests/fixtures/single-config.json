@@ -1,0 +1,24 @@
+{
+  "_fixture": "sanitized",
+  "remarks": "Helsinki Fixture",
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "single.example.invalid",
+            "port": 443,
+            "users": [
+              {
+                "id": "fixture-user-single",
+                "encryption": "none"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ]
+}

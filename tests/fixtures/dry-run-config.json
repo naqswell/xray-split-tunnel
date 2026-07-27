@@ -1,0 +1,18 @@
+{
+  "_fixture": "sanitized",
+  "remarks": "Dry Run Fixture",
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "socks",
+      "settings": {
+        "servers": [
+          {
+            "address": "upstream.example.invalid",
+            "port": 1080
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,91 @@
+{
+  "configs": [
+    {
+      "_fixture": "sanitized",
+      "remarks": "Oslo Primary",
+      "log": {
+        "loglevel": "warning"
+      },
+      "inbounds": [
+        {
+          "tag": "provider-http",
+          "protocol": "http",
+          "listen": "0.0.0.0",
+          "port": 18080,
+          "sniffing": {
+            "enabled": false,
+            "destOverride": []
+          }
+        }
+      ],
+      "outbounds": [
+        {
+          "tag": "proxy",
+          "protocol": "vless",
+          "settings": {
+            "vnext": [
+              {
+                "address": "edge-one.example.invalid",
+                "port": 443,
+                "users": [
+                  {
+                    "id": "fixture-user-one",
+                    "encryption": "none"
+                  }
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "tag": "direct",
+          "protocol": "blackhole"
+        },
+        {
+          "tag": "block",
+          "protocol": "blackhole"
+        }
+      ],
+      "routing": {
+        "domainStrategy": "IPOnDemand",
+        "rules": [
+          {
+            "type": "field",
+            "outboundTag": "block",
+            "domain": [
+              "full:ads.example.invalid"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "_fixture": "sanitized",
+      "name": "Oslo Backup",
+      "outbounds": [
+        {
+          "tag": "proxy",
+          "protocol": "vless",
+          "settings": {
+            "vnext": [
+              {
+                "address": "edge-two.example.invalid",
+                "port": 8443,
+                "users": [
+                  {
+                    "id": "fixture-user-two",
+                    "encryption": "none"
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "_fixture": "sanitized metadata, intentionally not a config",
+      "notice": "Fixture entries use reserved example.invalid names only."
+    }
+  ]
+}
