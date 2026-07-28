@@ -5,6 +5,15 @@
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-07-28
+
+### Изменено
+
+- README переработан в компактную публичную инструкцию с быстрым стартом через
+  Claude Code и без внутренних деталей agent-managed checkout;
+- GitHub Actions workflow исправлен: удалены регистронезависимые дубликаты
+  proxy environment variables, из-за которых GitHub отклонял workflow.
+
 ## [1.0.1] - 2026-07-28
 
 ### Добавлено

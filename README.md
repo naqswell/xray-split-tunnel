@@ -1,225 +1,186 @@
 # xray-split-tunnel
 
-Production-oriented setup для macOS: локальный **xray-core** с HTTP/SOCKS5
-proxy и правилами раздельной маршрутизации. Корпоративные домены и сети идут
-через системный стек macOS, всё остальное — через выбранный XRay outbound.
+Установка XRay на macOS с раздельной маршрутизацией для корпоративного
+доступа через Citrix Secure Access.
 
-Это не системный full-tunnel VPN. Трафик попадает в XRay только у приложений,
-которым задан proxy. Citrix Secure Access устанавливается и подключается
-отдельно; поддерживаемая интеграция описана в
-[`docs/citrix-prerequisites.md`](docs/citrix-prerequisites.md).
+Проект поднимает локальные HTTP- и SOCKS5-прокси, направляет корпоративные
+домены и сети в системный стек macOS, а остальной прокси-трафик — через
+выбранный XRay-сервер.
 
 ```text
-приложение с HTTP/SOCKS proxy
-             |
-             v
- xray-core, launchd com.xst.xray (user или system scope)
- HTTP 127.0.0.1:10809 · SOCKS5 127.0.0.1:10808
-             |
-             +-- private + BYPASS_CIDRS ------> direct ---> macOS/Citrix
-             +-- BYPASS_DOMAINS --------------> direct ---> macOS/Citrix
-             +-- всё остальное ---------------> XRay server
+приложение
+    |
+    | HTTP 127.0.0.1:10809
+    | SOCKS5 127.0.0.1:10808
+    v
+ xray-core
+    |
+    +-- корпоративные домены и CIDR --> direct --> macOS / Citrix
+    |
+    +-- остальной трафик ------------> XRay server
 ```
 
-## Что входит в handoff
+Это explicit proxy, а не системный full-tunnel VPN: через XRay идут только
+приложения, которым назначен прокси или которые запущены через `xst run`.
 
-Для воспроизводимого setup нужны:
+## Быстрый старт через Claude Code
 
-- опубликованный release этого репозитория;
-- опубликованный release соседнего `secure-access-helper`;
-- действующая XRay JSON subscription, введённая владельцем локально;
-- точные корпоративные domain suffix и CIDR;
-- установленный и вручную проверенный Citrix Secure Access с профилем,
-  client identity и CA-цепочкой;
-- один реальный внутренний HTTPS-ресурс для ручной приёмки.
+Откройте Claude Code в любом каталоге и отправьте ему один запрос:
 
-Пароль Citrix, subscription URL, сертификаты и рабочие конфиги не входят в Git
-и не передаются AI-агенту.
+```text
+Установи XRay split tunneling из репозитория
+https://github.com/naqswell/xray-split-tunnel.
+
+Сам клонируй последнюю стабильную версию в постоянный служебный каталог,
+прочитай CLAUDE.md и AGENTS.md и выполни весь сценарий установки.
+
+Не проси меня создавать файлы или выполнять команды. Для subscription URL
+сам запусти scripts/capture-sub-url.sh: я вставлю ссылку только в скрытое
+системное окно macOS, не в чат.
+
+Сначала выполни preflight и dry-run. Затем покажи краткое резюме изменений,
+запроси одно подтверждение и выполни установку, xst verify и отдельную
+проверку Citrix.
+```
+
+Claude самостоятельно:
+
+1. клонирует репозиторий в постоянный каталог;
+2. проверит окружение и существующие XRay/launchd-конфликты;
+3. откроет защищённый ввод ссылки подписки;
+4. соберёт параметры split tunneling;
+5. выполнит тесты и `--dry-run`;
+6. после подтверждения установит сервис и команды;
+7. запустит автоматическую проверку XRay и отдельную приёмку Citrix.
+
+От пользователя потребуются только:
+
+- вставить subscription URL в скрытое системное окно;
+- подтвердить параметры установки;
+- ввести пароль macOS, если выбран system scope с `sudo`;
+- пройти корпоративную авторизацию Citrix, если она ещё не выполнена.
+
+Subscription URL не нужно отправлять Claude или сохранять вручную.
 
 ## Требования
 
-- macOS 15 или новее, Apple Silicon или Intel;
-- активная графическая сессия для `SERVICE_SCOPE=user`; для always-on режима
-  доступен `SERVICE_SCOPE=system`;
-- `python3`, `curl`, `lsof` и стандартные macOS utilities;
+- macOS 15 или новее;
+- `python3`, `curl`, `lsof` и стандартные утилиты macOS;
 - Homebrew и `xray`, либо разрешение установить `xray` через Homebrew;
-- subscription, которая возвращает полный XRay JSON — см.
-  [`docs/subscription-format.md`](docs/subscription-format.md); выбранный
-  container ограничен 512 candidate elements до фильтрации.
+- XRay JSON subscription или обычный полный XRay JSON;
+- для корпоративного доступа — установленный Citrix Secure Access, рабочий
+  профиль, client identity и CA-цепочка;
+- точные корпоративные domain suffix и дополнительные CIDR.
 
-По умолчанию проект использует пользовательский LaunchAgent. Опциональный
-system LaunchDaemon запускается до GUI-login, но требует точечного `sudo` для
-установки/управления plist. Сам XRay в system scope всё равно работает от
-целевого пользователя, а секретный config не копируется в `/Library`.
+Проект устанавливает и настраивает XRay. Citrix-клиент, профиль и сертификаты
+относятся к корпоративному доступу и проверяются отдельно по
+[`docs/citrix-prerequisites.md`](docs/citrix-prerequisites.md).
 
-## Где Claude хранит исходники
+## Ручная установка
 
-`~/Projects` не требуется. Для agent-driven установки Claude сам использует
-служебный каталог:
+Этот раздел нужен только для установки без AI-агента.
+
+Клонируйте репозиторий в любой постоянный каталог:
 
 ```sh
-XST_SOURCE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
-mkdir -p "$(dirname "$XST_SOURCE_DIR")"
-git clone https://github.com/naqswell/xray-split-tunnel.git "$XST_SOURCE_DIR"
-cd "$XST_SOURCE_DIR"
-git status --short --branch
-make test
+git clone https://github.com/naqswell/xray-split-tunnel.git
+cd xray-split-tunnel
 ```
 
-Пользователь эти команды не выполняет: их выполняет Claude. Исходники должны
-оставаться в любом стабильном каталоге, потому что `~/.local/bin/xst` ссылается
-на них; рекомендуемый путь выше скрыт в application-data и не захламляет
-пользовательские проекты. `~/Projects`, Downloads и текущая директория
-пользователя не имеют специального значения.
+Checkout нельзя удалять после установки: команды в `~/.local/bin` ссылаются
+на него. Если каталог был перенесён, повторно запустите `install.sh`.
 
-Если release-копия передана без `.git`, вместо `git status` сверьте SHA-256
-архива с отдельно полученной суммой. Затем сверьте hash в файле `REVISION`
-внутри распакованного архива со значением `commit=` в release manifest.
-`scripts/release.sh` проверяет эту подстановку при сборке. `make test` должен
-завершиться с кодом `0` до первого изменения системы.
-
-## Установка через Claude: пользователь ничего не настраивает вручную
-
-Дайте Claude Code ссылку на этот публичный репозиторий и один запрос:
-
-```text
-Установи XRay + Citrix split tunneling из
-https://github.com/naqswell/xray-split-tunnel.
-Сам клонируй репозиторий, прочитай CLAUDE.md и AGENTS.md и выполни весь
-agent-driven сценарий: preflight, защищённый ввод subscription URL, dry-run,
-запрос подтверждения, установку и acceptance. Не проси меня создавать файлы
-или выполнять команды. Не проси и не принимай секреты в чате: для subscription
-URL сам запусти scripts/capture-sub-url.sh и попроси вставить ссылку только в
-скрытый системный диалог macOS.
-```
-
-Claude сам выполнит все shell-команды. Пользователь только:
-
-1. вставит subscription URL в скрытое системное окно;
-2. ответит на один набор вопросов о service scope, bypass/Citrix и
-   опциональных Claude-командах;
-3. подтвердит реальную установку после dry-run;
-4. введёт пароль macOS, только если согласован system scope с точечным `sudo`.
-
-### Безопасный ввод subscription URL
-
-URL содержит bearer-токен. Его нельзя вставлять в чат, shell-команду,
-environment или лог агента. Claude сам запускает:
+### 1. Введите subscription URL
 
 ```sh
 ./scripts/capture-sub-url.sh
 ```
 
-Helper открывает нативный скрытый диалог macOS, проверяет HTTPS URL и атомарно
-сохраняет его в `~/.config/xray-split-tunnel/sub-url` с правами `0600`.
-Значение не попадает в argv, environment или stdout. Для замены используйте
-`./scripts/capture-sub-url.sh --replace`. Если ссылка уже появлялась в чате
-или истории, её нужно перевыпустить до установки. Полная политика — в
-[`SECURITY.md`](SECURITY.md).
+Откроется нативное окно macOS со скрытым вводом. Helper проверит HTTPS URL и
+атомарно сохранит его в `~/.config/xray-split-tunnel/sub-url` с правами
+`0600`.
 
-### Обычный XRay JSON вместо подписки
-
-Подписка необязательна. Один полный XRay JSON с корневым непустым массивом
-`outbounds` можно передать как защищённый локальный файл:
+Для замены ссылки:
 
 ```sh
-install -d -m 700 "$HOME/.local/share/xst-import"
-chmod 600 "$HOME/.local/share/xst-import/config.json"
-XST_SUB_FILE="$HOME/.local/share/xst-import/config.json" \
-  XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --dry-run
-XST_SUB_FILE="$HOME/.local/share/xst-import/config.json" \
-  XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh
+./scripts/capture-sub-url.sh --replace
 ```
 
-XST использует proxy-outbound подключения, но намеренно заменяет исходные
-`inbounds` и `routing` своими loopback listener и правилами split tunneling.
-Это безопасный импорт, а не запуск произвольного конфига «как есть». Для
-локального файла автоматический `xst update` недоступен: чтобы применить его
-новую версию, повторите установку с `XST_SUB_FILE`. Поддерживаемые протоколы и
-формы JSON перечислены в
-[`docs/subscription-format.md`](docs/subscription-format.md).
-
-Для неинтерактивной установки корпоративные suffix/CIDR также передаются не
-через environment, а через локальный файл `0600`:
+### 2. Выполните dry-run
 
 ```sh
-install -d -m 700 "$HOME/.local/share/xst-input"
-install -m 600 /dev/null "$HOME/.local/share/xst-input/bypass.env"
-"${EDITOR:-vi}" "$HOME/.local/share/xst-input/bypass.env"
-```
-
-Формат файла data-only: ровно по одному ключу `BYPASS_DOMAINS=...` и
-`BYPASS_CIDRS=...`. Затем передаётся только несекретный путь
-`XST_BYPASS_FILE="$HOME/.local/share/xst-input/bypass.env"`.
-Переменные `XST_BYPASS_DOMAINS`/`XST_BYPASS_CIDRS` отклоняются.
-
-## Установка
-
-Сначала решите, разрешено ли менять `~/.zshrc`:
-
-- `XST_ZSHRC=0` — безопасный выбор для dotfiles/stow/symlink и любой
-  автоматической установки;
-- `XST_ZSHRC=1` — только если владелец явно разрешил изменить обычный
-  пользовательский `~/.zshrc`.
-
-Затем запустите:
-
-```sh
-cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
 XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --dry-run
+```
+
+Dry-run загружает и проверяет subscription, собирает все конфиги, запускает
+`xray run -test` и проверяет launchd plist, не устанавливая сервис.
+
+### 3. Установите сервис
+
+```sh
 XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh
 ```
 
-Для паритета с always-on setup явно выберите:
+Для запуска XRay до входа пользователя в macOS выберите system scope:
 
 ```sh
 XST_ZSHRC=0 XST_SERVICE_SCOPE=system ./install.sh
 ```
 
-Неинтерактивный запуск не отвечает «да» за владельца: установка Homebrew
-разрешается отдельным `XST_INSTALL_XRAY=1`, а shell и service scope всегда
-передаются явно.
+System scope требует точечного `sudo`. Сам процесс XRay продолжает работать от
+целевого пользователя, а секретный конфиг не копируется в `/Library`.
 
-Интерактивная установка объяснит различие и отдельно спросит про две
-независимые команды:
+## Обычный XRay JSON без подписки
 
-- `claude-xst` — только запускает Claude через managed proxy/NO_PROXY, ничего
-  не добавляя в контекст Claude;
-- `claude-xst-aware` — делает то же и добавляет в сессию краткую несекретную
-  инструкцию о split tunneling.
-
-Можно установить одну команду, обе или ни одной. Для non-interactive режима
-выбор задаётся независимо через `XST_CLAUDE_COMMAND=0|1` и
-`XST_CLAUDE_AWARE_COMMAND=0|1`; по умолчанию новые команды не создаются, а
-уже принадлежащие этой установке symlink сохраняются.
-
-Установщик спросит сервер, корпоративные domain suffix, дополнительные CIDR и
-порты. RFC1918, loopback, link-local и IPv6 ULA/link-local добавляются
-автоматически. Публичные корпоративные диапазоны, включая `11.0.0.0/8`, нужно
-указывать явно.
-
-Agent-driven установку выполняйте только по [`AGENTS.md`](AGENTS.md). Claude
-сам создаёт `sub-url` через GUI-helper, а `XST_ZSHRC` задаёт явно.
-
-Если выбран `XST_ZSHRC=0`, подключите сниппет в управляемом shell-конфиге:
+Вместо URL можно передать локальный файл:
 
 ```sh
-[ -f "$HOME/.config/xray-split-tunnel/shell.sh" ] && source "$HOME/.config/xray-split-tunnel/shell.sh"
+chmod 600 /path/to/config.json
+XST_SUB_FILE=/path/to/config.json \
+  XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --dry-run
+XST_SUB_FILE=/path/to/config.json \
+  XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh
 ```
 
-Сгенерированный сниппет объединяет managed bypass с уже существующими
-`NO_PROXY`/`no_proxy`, сохраняя прежние корпоративные исключения.
+Поддерживается один полный XRay-конфиг с корневым массивом `outbounds`, массив
+конфигов или один из документированных wrapper-форматов.
 
-## Команды
+XST использует proxy outbounds, но заменяет исходные `inbounds`, `routing`,
+DNS/API/logging и другие чувствительные top-level секции своими безопасными
+настройками. Подробности:
+[`docs/subscription-format.md`](docs/subscription-format.md).
+
+Для локального файла автоматический `xst update` недоступен. Новую версию
+применяют повторным запуском установщика с `XST_SUB_FILE`.
+
+## Основные параметры установки
+
+| Параметр | Назначение | По умолчанию |
+|---|---|---|
+| `XST_SERVICE_SCOPE` | `user` LaunchAgent или `system` LaunchDaemon | `user` |
+| `XST_ZSHRC` | разрешить изменение обычного `~/.zshrc` | требуется явный `0` или `1` |
+| `XST_SERVER` | индекс или однозначная часть имени сервера | `0` |
+| `XST_HTTP_PORT` | локальный HTTP proxy | `10809` |
+| `XST_SOCKS_PORT` | локальный SOCKS5 proxy | `10808` |
+| `XST_BYPASS_FILE` | защищённый файл с domain/CIDR bypass | нет |
+| `XST_CLAUDE_COMMAND` | установить `claude-xst` | `0` |
+| `XST_CLAUDE_AWARE_COMMAND` | установить `claude-xst-aware` | `0` |
+
+RFC1918, loopback, link-local и IPv6 ULA/link-local добавляются в direct
+автоматически. Публичные корпоративные сети необходимо указывать явно.
+
+Глобальный `HTTP_PROXY`/`HTTPS_PROXY` по умолчанию не включается.
+
+## Управление
 
 ```sh
 xst status
-xst doctor              # offline checks без внешней сети
+xst doctor
 xst list
 xst switch 0
 xst update
 xst apply
-xst check 192.168.1.1
+xst check intranet.example.com
 xst run curl -q -fsS https://api.ipify.org
 xst verify
 xst logs
@@ -229,248 +190,120 @@ xst start
 xst env
 ```
 
-`xst switch` принимает индекс либо однозначную часть remarks. `xst update`
-не переносит выбор по индексу: активный config должен иметь явное непустое
-`remarks`, `remark`, `name`, `ps` или `tag`, и это полное имя должно
-однозначно совпасть без учёта регистра с одним config новой подписки. Числовое
-remarks остаётся именем, а не индексом. Без такого доказательства update
-отменяется, сохраняя старое состояние. Перед загрузкой update также требует,
-чтобы active hash совпадал, а текущие subscription/index и настройки из
-`applied.env` детерминированно воспроизводили active config. После успешного
-update нумерация может измениться: проверьте `xst list`.
+- `xst doctor` выполняет offline-проверку состояния и прав.
+- `xst list` показывает доступные серверы.
+- `xst switch` переключает сервер по индексу или однозначной части имени.
+- `xst update` безопасно обновляет subscription, сохраняя выбранный сервер по
+  его устойчивой identity, а не по индексу.
+- `xst check` показывает ожидаемый маршрут для одного hostname или IP.
+- `xst run` запускает отдельный процесс с proxy и объединённым `NO_PROXY`.
+- `xst verify` выполняет полную автоматическую проверку XRay.
 
-## Как дать приложению XRay proxy
+## Claude через XRay
 
-Глобальный `HTTPS_PROXY` по умолчанию выключен, чтобы корпоративные CLI не
-попали в внешний туннель неожиданно.
-
-- Разовый процесс: `xst run curl -q -fsS https://api.ipify.org`.
-- Конкретное приложение: задайте HTTP proxy `127.0.0.1:10809` или SOCKS5
-  `127.0.0.1:10808` в его настройках.
-- Глобальный shell proxy: только после осознанного изменения
-  `EXPORT_HTTPS_PROXY=1` в `~/.config/xray-split-tunnel/env` и `xst apply`.
-
-Для Claude Code доступны две независимые опциональные команды:
+Установщик может добавить две независимые команды:
 
 ```sh
-claude-xst        # proxy/NO_PROXY, без дополнительной информации для Claude
-claude-xst-aware  # то же + route-инструкция в контексте сессии
+claude-xst
+claude-xst-aware
 ```
 
-Обе команды не меняют обычную `claude` и `~/.claude/settings.json`. Они
-запускают Claude через `xst run` и включают передачу hostname в proxy, поэтому
-Claude и запущенные им proxy-aware команды наследуют обе формы
-`HTTP(S)_PROXY` и `NO_PROXY`. `claude-xst` на этом останавливается: правила
-пользователь может полностью описать в своём `CLAUDE.md`.
-`claude-xst-aware` дополнительно передаёт стандартную несекретную инструкцию
-из `templates/claude-xst-instructions.md`.
+`claude-xst` запускает Claude через `xst run`, передаёт обе формы
+`HTTP(S)_PROXY` и `NO_PROXY`, но ничего не добавляет в контекст Claude.
 
-Корпоративные назначения идут системным путём, остальные — через XRay. XRay
-routing остаётся вторым слоем проверки, если запрос всё же вошёл в proxy.
-Утилита, которая полностью игнорирует стандартные proxy-переменные, этим
-механизмом не перехватывается.
+`claude-xst-aware` использует тот же сетевой слой и дополнительно передаёт
+несекретную инструкцию о правилах split tunneling. Это удобно, если сессия
+должна понимать назначение proxy и `NO_PROXY`.
 
-`NO_PROXY` — дополнительный shell-слой. Главная гарантия для запроса, уже
-вошедшего в XRay, — routing rules `direct`.
+Обычная команда `claude` и `~/.claude/settings.json` не изменяются.
 
-Routing использует `IPIfNonMatch`: неизвестное доменное имя может быть
-разрешено системным DNS, чтобы проверить IP/CIDR-правила, даже если затем
-соединение пойдёт через XRay proxy. Это сознательный компромисс split
-tunneling, а не DNS-privacy режим; подробности — в
-[`docs/how-it-works.md`](docs/how-it-works.md).
+## Проверка
 
-## Изменение bypass
-
-Отредактируйте `BYPASS_DOMAINS` и `BYPASS_CIDRS` в
-`~/.config/xray-split-tunnel/env`, затем:
-
-```sh
-xst apply
-xst verify
-```
-
-`env` — data-only формат `KEY=value`, а не shell script: не добавляйте
-`export`, command substitution или shell escaping. Неизвестные/повторные ключи
-отклоняются.
-
-До успешного `xst apply` lifecycle и диагностика используют последний
-доказанный `applied.env`; `status`, `logs` и emergency `stop` остаются
-доступны, даже если pending `env` повреждён или отсутствует. При этом
-`xst doctor` и `xst verify` возвращают non-zero, пока pending state не
-применён или не восстановлен.
-
-Проверяйте реальные значения через `xst check`. Не добавляйте домен или CIDR
-«на всякий случай»: лишний bypass отправляет соответствующий трафик мимо
-внешнего XRay.
-
-## Проверка и приёмка
-
-Автоматическая проверка:
+После установки:
 
 ```sh
 xst verify
-printf 'exit=%s\n' "$?"
 ```
 
-Успех — exit code `0`, валидный config, точное соответствие plist и config
-path, ожидаемый xray PID, оба принадлежащих ему локальных порта, обязательные
-валидные direct/proxy IP и успешные проверки всех domain/CIDR bypass.
-Предупреждение или частичный успех не заменяют exit code `0`. Для диагностики
-без внешней сети используйте `xst doctor`; он также проверяет владельцев,
-права state-файлов/plist и отсутствие подмены symlink.
+Успешный результат подтверждает:
 
-Автоматическая проверка не доказывает работу Citrix. Для полной приёмки нужны:
+- валидность активного XRay config;
+- точное соответствие launchd job и plist;
+- владельца процесса и оба loopback listener;
+- различие direct и proxy egress;
+- direct-маршрут для настроенных доменов и CIDR;
+- согласованность `NO_PROXY`.
 
-1. `secure-access-helper doctor`;
-2. `secure-access-helper status` со значением `Connected`;
-3. успешный доступ к одному реальному внутреннему HTTPS-ресурсу напрямую;
-4. успешный доступ к тому же ресурсу через локальный XRay proxy с маршрутом
-   `direct`;
-5. внешний IP через `xst run`, отличный от прямого.
+`xst verify` проверяет XRay, но не доказывает работу Citrix.
 
-Точные команды и критерии приведены в
-[`docs/citrix-prerequisites.md`](docs/citrix-prerequisites.md). Отчёт содержит
-только exit codes, версии, label, порты и факт доступности; URL, IP, ключи и
-конфиги в отчёт не копируются.
+Для полной приёмки Citrix необходимы:
 
-## Citrix
+1. состояние `Connected`;
+2. успешный прямой HTTPS-запрос к реальному внутреннему ресурсу;
+3. успешный запрос к тому же ресурсу через XRay с маршрутом `direct`;
+4. внешний egress через XRay, отличный от прямого.
 
-Рекомендуемый порядок:
+Пошаговая процедура:
+[`docs/citrix-prerequisites.md`](docs/citrix-prerequisites.md).
 
-1. установить и вручную проверить Citrix;
-2. установить и проверить `../secure-access-helper`;
-3. собрать точные bypass domains/CIDRs;
-4. установить XST;
-5. выполнить автоматическую и ручную приёмку.
+## Безопасность
 
-`direct` использует системный стек и попадёт в Citrix только когда Citrix
-действительно подключён и создал нужные route/DNS. XST не может исправить
-неверный Citrix profile, отсутствующий client identity или CA.
+Subscription URL, XRay config, UUID/Reality-параметры, Citrix credentials,
+сертификаты и внутренние адреса не должны попадать в Git, чат или логи.
 
-## Миграция со старого setup
+`scripts/capture-sub-url.sh` получает URL через скрытый системный диалог. URL
+не передаётся через аргументы или environment и не печатается в stdout.
 
-Legacy system LaunchDaemon `com.nqs.xray` обычно уже слушает те же порты
-`10809`/`10808`. Не запускайте новый agent параллельно: это создаёт конфликт и
-может дать ложную уверенность, что новый сервис работает.
+Если ссылка уже была опубликована в чате или issue, её необходимо отозвать и
+перевыпустить перед production-установкой.
 
-Выполните пошаговый rollback-safe runbook:
-[`docs/migration.md`](docs/migration.md). До новой установки legacy plist
-сначала сохраняется в durable rollback-каталоге вне
-`/Library/LaunchDaemons`, проверяется и только затем убирается из активного
-launchd-пути. Установщик ожидаемо откажет, пока
-`/Library/LaunchDaemons/com.nqs.xray.plist` остаётся на месте. Старый конфиг и
-rollback-копия plist сохраняются до полной приёмки и перезагрузки.
+Рабочее состояние хранится в `~/.config/xray-split-tunnel`:
 
-Смена `SERVICE_SCOPE` или label существующей XST-установки не выполняется
-неявно. Используйте явный uninstall/migration runbook: foreign plist/job и
-артефакт XST в противоположном scope установщик не перезаписывает.
-
-## Файлы и права
-
-| Путь | Назначение |
+| Данные | Права |
 |---|---|
-| `~/.config/xray-split-tunnel/env` | настройки, `0600` |
-| `~/.config/xray-split-tunnel/applied.env` | последние доказанно применённые настройки, `0600` |
-| `~/.config/xray-split-tunnel/sub-url` | subscription URL, секрет, `0600` |
-| `~/.config/xray-split-tunnel/subscription.json` | ответ провайдера, секрет, `0600` |
-| `~/.config/xray-split-tunnel/config.json` | активный XRay config, секрет, `0600` |
-| `~/.config/xray-split-tunnel/current-index` | выбранный config, `0600` |
-| `~/.config/xray-split-tunnel/active-config.sha256` | proof активного config, `0600` |
-| `~/.config/xray-split-tunnel/shell.sh` | shell-переменные, `0600` |
-| `~/Library/LaunchAgents/com.xst.xray.plist` | plist при `SERVICE_SCOPE=user` |
-| `/Library/LaunchDaemons/com.xst.xray.plist` | root-owned plist при `SERVICE_SCOPE=system` |
-| `~/Library/Logs/com.xst.xray.out.log` | stdout XRay |
-| `~/Library/Logs/com.xst.xray.err.log` | stderr XRay |
-| `~/.local/share/xray-split-tunnel/source` | agent-managed source checkout; пользователь его не обслуживает |
-| `~/.local/bin/xst` | symlink на `bin/xst` в agent-managed source |
-| `~/.local/bin/claude-xst` | опциональный Claude с XST proxy/NO_PROXY без route-инструкции |
-| `~/.local/bin/claude-xst-aware` | опциональный Claude с XST proxy/NO_PROXY и route-инструкцией |
+| каталог состояния | `0700` |
+| `sub-url`, `subscription.json`, `config.json`, настройки | `0600` |
+| user LaunchAgent plist | `0600`, владелец — пользователь |
+| system LaunchDaemon plist | `0644`, владелец — `root:wheel` |
+| launchd logs | `0600` |
 
-Фактические label и порты могут отличаться; `xst env` показывает активные
-пути без вывода содержимого секретных файлов.
+Полная модель угроз и правила работы с секретами:
+[`SECURITY.md`](SECURITY.md).
 
-Каталог состояния должен принадлежать текущему пользователю и иметь `0700`;
-его секретные и служебные файлы — `0600` и не symlink. User plist принадлежит
-пользователю и имеет `0600`; system plist принадлежит `root:wheel` и имеет
-`0644`. Новый установщик принимает только пустой каталог, доказанно managed
-XST-каталог или
-preprovisioned каталог с единственным защищённым `sub-url`, либо полный
-markerless legacy state с `env`, `subscription.json`, `config.json`,
-`current-index`, `active-config.sha256` и `shell.sh`, причём hash и
-существующий plist должны отдельно доказать ту же XST identity. В legacy state
-допустимы только известные XST-файлы:
-`env`, `applied.env`, `sub-url`, `subscription.json`, `config.json`,
-`current-index`, `active-config.sha256`, `shell.sh`; каждый — user-owned
-`0600`. Произвольный непустой каталог и foreign plist/job отклоняются.
+## Миграция
 
-Mutating-операции используют fail-fast lock
-`~/.config/xray-split-tunnel/.xst-operation.lock` (`0700`). Не запускайте
-install/apply/update/switch/lifecycle/uninstall параллельно. Не удаляйте
-занятый или stale lock автоматически: сначала убедитесь, что другой процесс
-не выполняет операцию, затем разберите причину аварийного завершения.
+Существующий LaunchDaemon `com.nqs.xray` обычно использует те же порты.
+Установщик остановится, если обнаружит legacy setup или конфликтующий
+plist/job.
 
-## Диагностика
-
-| Симптом | Действие |
-|---|---|
-| label не загружен | `xst logs`, затем `xst restart` |
-| один из портов занят | найдите владельца через `lsof`; при legacy setup выполните migration runbook |
-| proxy IP отсутствует или совпадает с direct | проверьте `xst status`, subscription и outbound |
-| XRay отвергает config | запустите `xray run -test` по пути из `xst env`, не публикуя сам config |
-| домен идёт не в `direct` | исправьте точный suffix в `BYPASS_DOMAINS`, затем `xst apply` |
-| IP идёт не в `direct` | добавьте подтверждённый CIDR в `BYPASS_CIDRS`, затем `xst apply` |
-| Citrix `Connected`, но ресурс недоступен | проверьте profile, DNS, route, identity и CA отдельно от XST |
-
-Архитектура и ограничения подробно описаны в
-[`docs/how-it-works.md`](docs/how-it-works.md).
+Не удаляйте старую установку вручную. Используйте rollback-safe процедуру:
+[`docs/migration.md`](docs/migration.md).
 
 ## Удаление
 
+Из каталога репозитория:
+
 ```sh
-cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
 ./uninstall.sh
 ```
 
-Обычное удаление оставляет секретное состояние для восстановления. Полный
-purge необратимо удаляет subscription и config:
+Обычное удаление останавливает сервис и удаляет принадлежащие установке
+plist/job, logs и command symlinks, но сохраняет секретное состояние.
+
+Полное удаление состояния:
 
 ```sh
 ./uninstall.sh --purge
 ```
 
-Выполняйте purge только после проверки точного пути, наличия резервной копии
-при необходимости и явного решения владельца. `xray` Homebrew-пакет
-автоматически не удаляется. Uninstall берёт service identity только из
-зафиксированного `applied.env` и удаляет plist/job/logs лишь после exact proof.
-Обычный uninstall остаётся доступен при отсутствующем или повреждённом pending
-`env`; необратимый `--purge` требует полного owner/mode/marker audit. При
-удалении managed блока `~/.zshrc` создаётся уникальная локальная backup-копия.
+`--purge` необратимо удаляет subscription и активный config.
 
-## Публикация release
+## Документация
 
-Архив собирается только из clean `HEAD` с exact tag `v$(cat VERSION)`:
-
-```sh
-./scripts/release.sh
-```
-
-Скрипт запускает tests, создаёт детерминированный `.tar.gz`, SHA-256 manifest
-и проверяет, что `git archive` подставил commit в `REVISION`, совпадающий с
-manifest. Существующие artifact paths и symlink output directory не
-перезаписываются. Криптографическую подпись Git tag этот workflow не проверяет
-и не заявляет.
-
-До передачи сопровождающий должен:
-
-1. убедиться, что Git не содержит runtime state, subscription, ключи и
-   сертификаты;
-2. выполнить `make test` и shell/static checks;
-3. проверить установку, transaction rollback и отдельный migration rollback
-   на чистом пользователе macOS;
-4. зафиксировать commit, создать точный version tag и неизменяемый архив;
-5. опубликовать SHA-256 отдельно от архива;
-6. убедиться, что указанный release `secure-access-helper` тоже доступен;
-7. приложить заполненный, но обезличенный acceptance checklist.
-
-До выполнения этих шагов checkout является development-снимком, а не
-передаваемым production release.
+- [Инструкция для AI-агента](AGENTS.md)
+- [Архитектура и маршрутизация](docs/how-it-works.md)
+- [Формат subscription и локального JSON](docs/subscription-format.md)
+- [Citrix prerequisites и acceptance](docs/citrix-prerequisites.md)
+- [Миграция с legacy setup](docs/migration.md)
+- [Политика безопасности](SECURITY.md)
+- [История изменений](CHANGELOG.md)
