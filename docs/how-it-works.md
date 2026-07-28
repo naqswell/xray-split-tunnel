@@ -96,9 +96,11 @@ Label, scope, пути к бинарнику и конфигу зафиксир�
 сверяет exact real executable, полный argv и UID процесса, проверяет строгий
 plist/log hardening, оба принадлежащих процессу IPv4 loopback listener и hash
 применённого config. Команда
-`~/.local/bin/xst` является ссылкой в checkout репозитория, поэтому checkout
-должен оставаться в `~/Projects/setup/xray-split-tunnel`. После переноса нужно
-повторно запустить установку.
+`~/.local/bin/xst` является ссылкой в source checkout репозитория, поэтому
+checkout должен оставаться в любом стабильном каталоге. Для agent-driven
+установки рекомендуется служебный
+`~/.local/share/xray-split-tunnel/source`; `~/Projects` не требуется. После
+переноса source checkout нужно повторно запустить установку.
 
 Существующий target plist/job принимается только вместе с `env` и core plist,
 которые доказывают прежнюю managed XST-установку в том же scope. Foreign

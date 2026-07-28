@@ -51,7 +51,8 @@ managed XST-установка или найден XST plist в противоп
 
 ## Переключение
 
-1. Подготовьте новый checkout в стабильном пути и защищённый `sub-url`.
+1. Поручите агенту подготовить source checkout в стабильном application-data
+   каталоге и защищённый `sub-url` через GUI-helper.
 
 2. Создайте новый durable rollback-каталог, скопируйте туда legacy plist и
    проверьте копию. Команды намеренно откажут, если этот путь уже занят:
@@ -98,7 +99,7 @@ managed XST-установка или найден XST plist в противоп
    Для сохранения always-on поведения legacy выберите `system`:
 
    ```sh
-   cd "$HOME/Projects/setup/xray-split-tunnel"
+   cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
    XST_ZSHRC=0 XST_SERVICE_SCOPE=system ./install.sh --dry-run
    XST_ZSHRC=0 XST_SERVICE_SCOPE=system ./install.sh
    ```

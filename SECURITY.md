@@ -44,18 +44,19 @@ XST-артефакт в противоположном launchd scope счита�
 
 ## Безопасная передача subscription URL
 
-Не вставляйте URL в чат, shell-команду, переменную окружения процесса, issue или
-CI secret, который печатается в лог. Введите его локально без echo:
+Не вставляйте URL в чат, shell-команду, переменную окружения процесса, issue
+или CI secret, который печатается в лог. При agent-driven установке Claude сам
+запускает:
 
 ```sh
-install -d -m 700 "$HOME/.config/xray-split-tunnel"
-/bin/bash -c 'umask 077; read -r -s -p "Subscription URL: " url; printf "\n"; printf "%s\n" "$url" > "$HOME/.config/xray-split-tunnel/sub-url"'
-chmod 600 "$HOME/.config/xray-split-tunnel/sub-url"
+./scripts/capture-sub-url.sh
 ```
 
-После этого человеку или агенту достаточно сообщить: «файл `sub-url`
-подготовлен». Читать или выводить файл для проверки нельзя; проверяются только
-его наличие, владелец и права.
+Helper получает значение через скрытый системный диалог macOS, проверяет URL и
+атомарно сохраняет `sub-url` с правами `0600` под operation lock. URL не
+передаётся через argv/environment и не печатается. Для ротации используется
+`./scripts/capture-sub-url.sh --replace`. Агент проверяет только наличие,
+владельца и права файла и никогда не читает его содержимое.
 
 Конфиденциальные bypass domains/CIDR для неинтерактивной установки также
 передаются только через отдельный data-only файл `0600` вне `XST_HOME`.

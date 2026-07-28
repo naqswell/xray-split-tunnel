@@ -12,7 +12,9 @@ test-python:
 	PYTHONDONTWRITEBYTECODE=1 "$(PYTHON)" -m unittest discover -s tests -p 'test_*.py' -v
 
 test-shell:
-	@for script in install.sh uninstall.sh bin/xst lib/common.sh tests/run.sh; do \
+	@for script in install.sh uninstall.sh bin/xst bin/claude-xst \
+		bin/claude-xst-aware lib/common.sh scripts/capture-sub-url.sh \
+		scripts/release.sh tests/run.sh; do \
 		"$(BASH)" -n "$$script" || exit; \
 	done
 

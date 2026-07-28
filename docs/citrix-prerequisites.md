@@ -6,12 +6,13 @@
 Secure Access. Он только гарантирует, что перечисленные корпоративные
 назначения выходят через системный стек macOS, где ими уже управляет Citrix.
 
-Автоматизация Citrix находится в отдельном checkout:
+Автоматизация Citrix находится в отдельном опубликованном репозитории. Агент
+может хранить оба source checkout в application-data; `~/Projects` не нужен:
 
 ```text
-~/Projects/setup/
-├── xray-split-tunnel/
-└── secure-access-helper/
+~/.local/share/
+├── xray-split-tunnel/source/
+└── secure-access-helper/source/
 ```
 
 Для воспроизводимого handoff оба checkout должны быть опубликованными
@@ -37,11 +38,11 @@ Client identity передаётся только защищённым кана�
 
 ## Установка helper
 
-Получите опубликованную версию `secure-access-helper` и разместите её в
-`~/Projects/setup/secure-access-helper`, затем следуйте его `README.md`:
+Получите опубликованную версию `secure-access-helper`; для agent-driven пути
+Claude сам размещает её в стабильном служебном каталоге и следует README:
 
 ```sh
-cd "$HOME/Projects/setup/secure-access-helper"
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/secure-access-helper/source"
 ./install.sh
 secure-access-helper doctor
 secure-access-helper connect

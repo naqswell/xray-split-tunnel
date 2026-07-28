@@ -36,39 +36,54 @@
 - Не публикуй логи без редактирования `id`, `publicKey`, `shortId`,
   `serverName`/`sni`, endpoint, внутреннего FQDN и публичного IP.
 
-## Один запрос владельцу до установки
+## Agent-driven установка
 
-Спроси одним сообщением только:
+Пользователь не должен создавать XST-файлы, редактировать конфиги или выполнять
+shell-команды вместо тебя. Сам клонируй/проверь репозиторий, запусти helper,
+dry-run, установку и acceptance-команды. У пользователя запрашивай только
+решения, секреты через защищённый системный UI и системные подтверждения,
+которые невозможно дать без владельца машины.
 
-1. подготовлен ли локальный `~/.config/xray-split-tunnel/sub-url`;
-2. точные domain suffix для bypass;
-3. дополнительные корпоративные CIDR вне автоматически добавляемых сетей;
-4. индекс или однозначное название XRay server;
-5. нужен ли `SERVICE_SCOPE=user` или `system`; для паритета с текущим
+Если защищённого `sub-url` ещё нет, сам запусти:
+
+```sh
+./scripts/capture-sub-url.sh
+```
+
+macOS покажет отдельный скрытый диалог. Попроси пользователя вставить ссылку
+туда, но не в чат. Helper сам проверит URL, атомарно создаст XST state и
+сохранит `sub-url` с правами `0600`; в stdout попадёт только подтверждение без
+значения. Если ранее раскрытая ссылка перевыпущена, используй
+`./scripts/capture-sub-url.sh --replace`. Никогда не проси пользователя
+создавать этот файл вручную и не читай его содержимое.
+
+После read-only preflight одним сообщением запроси только те решения, которые
+не удалось доказанно определить:
+
+1. точные domain suffix для bypass;
+2. дополнительные корпоративные CIDR вне автоматически добавляемых сетей;
+3. индекс или однозначное название XRay server;
+4. нужен ли `SERVICE_SCOPE=user` или `system`; для паритета с текущим
    always-on setup используй `system`, только после согласия на точечный sudo;
-6. разрешено ли менять обычный `~/.zshrc`; для dotfiles/stow/symlink предложи
+5. разрешено ли менять обычный `~/.zshrc`; для dotfiles/stow/symlink предложи
    `XST_ZSHRC=0`;
+6. установить ли `claude-xst`, `claude-xst-aware`, обе команды или ни одной;
 7. установлен ли Citrix, импортированы ли profile/identity/CA и прошла ли
    ручная проверка внутреннего ресурса;
 8. готов ли опубликованный `secure-access-helper`.
 
-Если `sub-url` не подготовлен, попроси владельца самому выполнить локально:
-
-```sh
-install -d -m 700 "$HOME/.config/xray-split-tunnel"
-/bin/bash -c 'umask 077; read -r -s -p "Subscription URL: " url; printf "\n"; printf "%s\n" "$url" > "$HOME/.config/xray-split-tunnel/sub-url"'
-chmod 600 "$HOME/.config/xray-split-tunnel/sub-url"
-```
-
-Продолжай после ответа «файл подготовлен». Проверяй `stat`, но никогда `cat`.
 Если URL уже был отправлен в чат, сначала потребуй его ротацию.
 
 ## Preflight без изменений
 
-Работай только из стабильного checkout:
+Если репозиторий ещё не клонирован, сам создай служебный source checkout.
+Не требуй от пользователя каталог `~/Projects`:
 
 ```sh
-cd "$HOME/Projects/setup/xray-split-tunnel"
+XST_SOURCE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
+mkdir -p "$(dirname "$XST_SOURCE_DIR")"
+git clone https://github.com/naqswell/xray-split-tunnel.git "$XST_SOURCE_DIR"
+cd "$XST_SOURCE_DIR"
 pwd
 git status --short --branch
 stat -f '%Su %Lp %N' "$HOME/.config/xray-split-tunnel" \
@@ -112,10 +127,10 @@ runbook. Существующий целевой plist/job разрешён то
 plist доказывают, что это прежняя установка XST с тем же label и scope.
 Foreign plist/job и артефакт в противоположном scope не перезаписывай.
 
-Проверь Citrix отдельно:
+Проверь Citrix отдельно через установленную команду; расположение checkout
+helper не должно быть пользовательским требованием:
 
 ```sh
-cd "$HOME/Projects/setup/secure-access-helper"
 secure-access-helper doctor
 secure-access-helper status
 ```
@@ -125,18 +140,15 @@ secure-access-helper status
 
 ## Установка
 
-Интерактивный путь предпочтителен: он позволяет владельцу проверить значения.
-Всегда задавай решение по shell явно:
+Для agent-driven пути собери ответы один раз и передай все несекретные решения
+явными `XST_*`. Сначала выполни production dry-run, затем кратко покажи
+результат и запроси одно подтверждение реальной установки. Всегда задавай
+решение по shell явно:
 
 ```sh
-cd "$HOME/Projects/setup/xray-split-tunnel"
-XST_ZSHRC=0 ./install.sh
-```
-
-До изменений выполни production dry-run с теми же несекретными параметрами:
-
-```sh
-XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --dry-run
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
+XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --non-interactive --dry-run
+XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --non-interactive
 ```
 
 Используй `XST_ZSHRC=1` только после явного разрешения. При `XST_ZSHRC=0`
@@ -146,11 +158,11 @@ XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --dry-run
 [ -f "$HOME/.config/xray-split-tunnel/shell.sh" ] && source "$HOME/.config/xray-split-tunnel/shell.sh"
 ```
 
-Неинтерактивный режим разрешён, когда все ответы уже получены. Передай
-server/ports штатными `XST_*`, а конфиденциальные domains/CIDR — только через
-заранее созданный защищённый `XST_BYPASS_FILE`. Не задавай `XST_SUB_URL`:
-установщик должен прочитать заранее созданный `sub-url`. `XST_ZSHRC` в таком
-запуске также обязателен. Не используй
+Передай server/ports штатными `XST_*`, а конфиденциальные domains/CIDR — только
+через защищённый `XST_BYPASS_FILE`, который сам создай атомарно из
+подтверждённых значений, не печатая содержимое. Не задавай `XST_SUB_URL`:
+установщик читает `sub-url`, созданный GUI-helper. `XST_ZSHRC` в таком запуске
+обязателен. Не используй
 `XST_ASSUME_YES=1` для действий, на которые владелец не дал согласия.
 
 Переменные интерфейса:
@@ -193,7 +205,7 @@ install/apply/update/switch/lifecycle/uninstall. Занятый или оста�
 Запусти:
 
 ```sh
-cd "$HOME/Projects/setup/xray-split-tunnel"
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
 ./bin/xst verify
 verify_rc=$?
 printf 'xst verify exit=%s\n' "$verify_rc"
@@ -231,10 +243,11 @@ container подписки содержит не более 512 candidate
 elements до фильтрации (DoS guard), и каждый нормализованный config проходит
 `xray run -test`.
 
-## Ручная приёмка Citrix
+## Живая приёмка Citrix
 
-Автоматизация не знает внутренний ресурс и не может завершить этот шаг без
-владельца.
+Автоматизация не знает внутренний ресурс, но агент по-прежнему сам запускает
+все проверочные команды. Владелец только вводит внутренний URL в локальный
+скрытый prompt и подтверждает Citrix authentication; он не копирует команды.
 
 ```sh
 secure-access-helper doctor
@@ -243,19 +256,20 @@ secure-access-helper status
 xst run curl -q -fsS https://api.ipify.org
 ```
 
-Затем владелец выполняет две команды с локальным hidden-from-agent URL из
-`docs/citrix-prerequisites.md`: прямой HTTPS-запрос и запрос через XRay с
-очищенным `NO_PROXY`. Оба должны установить доверенный TLS и вернуть ненулевой
-HTTP status. `secure-access-helper status` должен оставаться `Connected`.
+Затем агент запускает две команды из `docs/citrix-prerequisites.md`: прямой
+HTTPS-запрос и запрос через XRay с очищенным `NO_PROXY`. Владелец вводит URL
+только в их скрытый локальный prompt. Оба запроса должны установить доверенный
+TLS и вернуть ненулевой HTTP status. `secure-access-helper status` должен
+оставаться `Connected`.
 
-Если Citrix отключён, сертификат отсутствует или владелец не выполнил живую
-проверку, статус результата — «XRay готов, Citrix acceptance не завершён».
+Если Citrix отключён, сертификат отсутствует или живая проверка не выполнена,
+статус результата — «XRay готов, Citrix acceptance не завершён».
 
 ## Диагностика и rollback
 
 | Симптом | Действие |
 |---|---|
-| subscription не скачивается | не проси URL; владелец проверяет/заменяет `sub-url` локально |
+| subscription не скачивается | не проси URL; сам запусти `scripts/capture-sub-url.sh --replace`, владелец вставит перевыпущенную ссылку в скрытый dialog |
 | формат не распознан | `docs/subscription-format.md`; используйте обезличенно конвертированный `XST_SUB_FILE` |
 | xray отвергает config | покажи только диагностические строки после редактирования секретов |
 | порт занят | найди PID/command через `lsof`; для `com.nqs.xray` выполни migration runbook |
@@ -294,6 +308,7 @@ Citrix acceptance: для них применяется отдельная ру�
 | Путь | Роль |
 |---|---|
 | `install.sh` | установка и первичная проверка |
+| `scripts/capture-sub-url.sh` | скрытый GUI-ввод subscription URL без передачи агенту |
 | `bin/xst` | управление и verification |
 | `lib/xstlib.py` | нормализация JSON, сборка config, route-check |
 | `lib/common.sh` | пути, загрузка, launchctl и shell snippet |

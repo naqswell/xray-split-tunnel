@@ -16,6 +16,7 @@ SHELL_FILES = [
     ROOT / "bin" / "claude-xst",
     ROOT / "bin" / "claude-xst-aware",
     ROOT / "lib" / "common.sh",
+    ROOT / "scripts" / "capture-sub-url.sh",
     ROOT / "scripts" / "release.sh",
     ROOT / "tests" / "run.sh",
 ]
@@ -260,6 +261,68 @@ class CommonShellSafetyTests(unittest.TestCase):
 
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("%s должен быть 0 или 1" % variable, result.stderr)
+
+    def test_agent_capture_sub_url_uses_gui_and_protects_secret(self):
+        secret = "https://provider.example.invalid/fixture-subscription-token"
+        osascript_called = self.tmp / "osascript-called"
+        osascript_argv = self.tmp / "osascript-argv"
+        uname = self.stub_bin / "uname"
+        uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
+        uname.chmod(0o755)
+        osascript = self.stub_bin / "osascript"
+        osascript.write_text(
+            "#!/bin/sh\n"
+            ': > "${XST_TEST_OSASCRIPT_CALLED:?}"\n'
+            'printf "%s\\n" "$@" > "${XST_TEST_OSASCRIPT_ARGV:?}"\n'
+            "printf '%s\\n' 'https://provider.example.invalid/fixture-subscription-token'\n",
+            encoding="utf-8",
+        )
+        osascript.chmod(0o755)
+        env = self.shell_env()
+        env.update(
+            {
+                "XST_TEST_OSASCRIPT_CALLED": str(osascript_called),
+                "XST_TEST_OSASCRIPT_ARGV": str(osascript_argv),
+            }
+        )
+
+        result = subprocess.run(
+            [str(BASH), str(ROOT / "scripts" / "capture-sub-url.sh")],
+            cwd=str(ROOT),
+            env={**os.environ, **env},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(osascript_called.exists())
+        self.assertEqual(osascript_argv.read_text(encoding="utf-8"), "\n")
+        self.assertNotIn(secret, result.stdout)
+        self.assertNotIn(secret, result.stderr)
+        sub_url = self.state / "sub-url"
+        self.assertEqual(sub_url.read_text(encoding="utf-8"), secret + "\n")
+        self.assertEqual(sub_url.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o700)
+        self.assertFalse((self.state / ".xst-operation.lock").exists())
+
+        osascript_called.unlink()
+        second = subprocess.run(
+            [str(BASH), str(ROOT / "scripts" / "capture-sub-url.sh")],
+            cwd=str(ROOT),
+            env={**os.environ, **env},
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertFalse(
+            osascript_called.exists(),
+            "existing valid sub-url must not open or replace the secret",
+        )
+        self.assertEqual(sub_url.read_text(encoding="utf-8"), secret + "\n")
 
     def test_fetch_uses_stdin_config_and_keeps_url_out_of_argv_and_environment(self):
         argv_log = self.tmp / "curl-argv"

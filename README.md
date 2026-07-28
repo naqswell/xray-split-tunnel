@@ -52,22 +52,25 @@ system LaunchDaemon запускается до GUI-login, но требует �
 установки/управления plist. Сам XRay в system scope всё равно работает от
 целевого пользователя, а секретный config не копируется в `/Library`.
 
-## Подготовка release-копии
+## Где Claude хранит исходники
 
-Получите версионированный архив и SHA-256 у сопровождающего по независимым
-каналам. После проверки распакуйте checkout в стабильный путь:
+`~/Projects` не требуется. Для agent-driven установки Claude сам использует
+служебный каталог:
 
 ```sh
-mkdir -p "$HOME/Projects/setup"
-cd "$HOME/Projects/setup/xray-split-tunnel"
+XST_SOURCE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
+mkdir -p "$(dirname "$XST_SOURCE_DIR")"
+git clone https://github.com/naqswell/xray-split-tunnel.git "$XST_SOURCE_DIR"
+cd "$XST_SOURCE_DIR"
 git status --short --branch
 make test
 ```
 
-Каталог должен остаться именно
-`~/Projects/setup/xray-split-tunnel`: `~/.local/bin/xst` ссылается в checkout.
-Не запускайте production-установку из Downloads, временного каталога или
-случайной worktree.
+Пользователь эти команды не выполняет: их выполняет Claude. Исходники должны
+оставаться в любом стабильном каталоге, потому что `~/.local/bin/xst` ссылается
+на них; рекомендуемый путь выше скрыт в application-data и не захламляет
+пользовательские проекты. `~/Projects`, Downloads и текущая директория
+пользователя не имеют специального значения.
 
 Если release-копия передана без `.git`, вместо `git status` сверьте SHA-256
 архива с отдельно полученной суммой. Затем сверьте hash в файле `REVISION`
@@ -75,24 +78,44 @@ make test
 `scripts/release.sh` проверяет эту подстановку при сборке. `make test` должен
 завершиться с кодом `0` до первого изменения системы.
 
-Публичный remote у проекта пока не зафиксирован в документации, поэтому здесь
-намеренно нет вымышленной команды `git clone`. Сопровождающий обязан указать
-реальный release tag, commit и checksum при передаче.
+## Установка через Claude: пользователь ничего не настраивает вручную
 
-## Безопасный ввод subscription URL
+Дайте Claude Code ссылку на этот публичный репозиторий и один запрос:
 
-URL содержит bearer-токен. Не вставляйте его в чат, shell-команду, environment
-или лог агента. Владелец машины вводит URL без echo в локальный файл:
-
-```sh
-install -d -m 700 "$HOME/.config/xray-split-tunnel"
-/bin/bash -c 'umask 077; read -r -s -p "Subscription URL: " url; printf "\n"; printf "%s\n" "$url" > "$HOME/.config/xray-split-tunnel/sub-url"'
-chmod 600 "$HOME/.config/xray-split-tunnel/sub-url"
+```text
+Установи XRay + Citrix split tunneling из
+https://github.com/naqswell/xray-split-tunnel.
+Сам клонируй репозиторий, прочитай CLAUDE.md и AGENTS.md и выполни весь
+agent-driven сценарий: preflight, защищённый ввод subscription URL, dry-run,
+запрос подтверждения, установку и acceptance. Не проси меня создавать файлы
+или выполнять команды. Не проси и не принимай секреты в чате: для subscription
+URL сам запусти scripts/capture-sub-url.sh и попроси вставить ссылку только в
+скрытый системный диалог macOS.
 ```
 
-После этого агенту сообщают только: «`sub-url` подготовлен». Если ссылка уже
-появлялась в чате или истории, её нужно перевыпустить до установки. Полная
-политика — в [`SECURITY.md`](SECURITY.md).
+Claude сам выполнит все shell-команды. Пользователь только:
+
+1. вставит subscription URL в скрытое системное окно;
+2. ответит на один набор вопросов о service scope, bypass/Citrix и
+   опциональных Claude-командах;
+3. подтвердит реальную установку после dry-run;
+4. введёт пароль macOS, только если согласован system scope с точечным `sudo`.
+
+### Безопасный ввод subscription URL
+
+URL содержит bearer-токен. Его нельзя вставлять в чат, shell-команду,
+environment или лог агента. Claude сам запускает:
+
+```sh
+./scripts/capture-sub-url.sh
+```
+
+Helper открывает нативный скрытый диалог macOS, проверяет HTTPS URL и атомарно
+сохраняет его в `~/.config/xray-split-tunnel/sub-url` с правами `0600`.
+Значение не попадает в argv, environment или stdout. Для замены используйте
+`./scripts/capture-sub-url.sh --replace`. Если ссылка уже появлялась в чате
+или истории, её нужно перевыпустить до установки. Полная политика — в
+[`SECURITY.md`](SECURITY.md).
 
 ### Обычный XRay JSON вместо подписки
 
@@ -142,7 +165,7 @@ install -m 600 /dev/null "$HOME/.local/share/xst-input/bypass.env"
 Затем запустите:
 
 ```sh
-cd "$HOME/Projects/setup/xray-split-tunnel"
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
 XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh --dry-run
 XST_ZSHRC=0 XST_SERVICE_SCOPE=user ./install.sh
 ```
@@ -175,9 +198,8 @@ XST_ZSHRC=0 XST_SERVICE_SCOPE=system ./install.sh
 автоматически. Публичные корпоративные диапазоны, включая `11.0.0.0/8`, нужно
 указывать явно.
 
-Неинтерактивную установку выполняйте только по [`AGENTS.md`](AGENTS.md). URL
-должен браться из заранее подготовленного `sub-url`, а `XST_ZSHRC` всё равно
-задаётся явно.
+Agent-driven установку выполняйте только по [`AGENTS.md`](AGENTS.md). Claude
+сам создаёт `sub-url` через GUI-helper, а `XST_ZSHRC` задаёт явно.
 
 Если выбран `XST_ZSHRC=0`, подключите сниппет в управляемом shell-конфиге:
 
@@ -359,7 +381,8 @@ rollback-копия plist сохраняются до полной приёмк�
 | `/Library/LaunchDaemons/com.xst.xray.plist` | root-owned plist при `SERVICE_SCOPE=system` |
 | `~/Library/Logs/com.xst.xray.out.log` | stdout XRay |
 | `~/Library/Logs/com.xst.xray.err.log` | stderr XRay |
-| `~/.local/bin/xst` | symlink на `bin/xst` в checkout |
+| `~/.local/share/xray-split-tunnel/source` | agent-managed source checkout; пользователь его не обслуживает |
+| `~/.local/bin/xst` | symlink на `bin/xst` в agent-managed source |
 | `~/.local/bin/claude-xst` | опциональный Claude с XST proxy/NO_PROXY без route-инструкции |
 | `~/.local/bin/claude-xst-aware` | опциональный Claude с XST proxy/NO_PROXY и route-инструкцией |
 
@@ -404,7 +427,7 @@ install/apply/update/switch/lifecycle/uninstall параллельно. Не у�
 ## Удаление
 
 ```sh
-cd "$HOME/Projects/setup/xray-split-tunnel"
+cd "${XDG_DATA_HOME:-$HOME/.local/share}/xray-split-tunnel/source"
 ./uninstall.sh
 ```
 
